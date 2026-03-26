@@ -21,6 +21,19 @@ Enhanced Voice Assistant with:
 - Dataclass-based configuration
 - Structured logging with request IDs
 - MODULARIZED: Config extracted to config.py
+
+PATCHES applied (see CHANGES below each affected section):
+  #1  VAD record loop: consume frame even when echo-suppressing (prevents buffer drift)
+  #2  VAD frame size: computed from actual frame duration, not hardcoded 480 samples
+  #3  PyAudio stream: opened once at startup and reused across all TTS calls
+  #4  Prewarm OpenAI: cheap max_tokens=1 chat call instead of models.list()
+  #5  Health check OpenAI: same cheap ping instead of models.list()
+  #6  Brightness regex: anchored so "3000k" no longer extracts "300" as brightness
+  #7  trim_conversation: index arithmetic instead of list.index() (no ValueError risk)
+  #8  Follow-up VAD threshold: uses ambient-calibrated value, not hardcoded *3.0
+  #9  debug_tools / debug_ha defaults moved to False in config.py
+  #10 SFX listening_wav: now actually played when recording begins
+  #11 Thread pool: max_workers raised from 4 to 6
 """
 
 import os
@@ -165,15 +178,18 @@ _async_session: Optional[aiohttp.ClientSession] = None
 sync_client: Optional[OpenAI] = None
 async_client: Optional[AsyncOpenAI] = None
 
-# PyAudio instance for streaming playback
+# PATCH #3: persistent PyAudio stream reused across all TTS calls
 _pyaudio_instance: Optional[Any] = None
+_pyaudio_stream: Optional[Any] = None
+_pyaudio_stream_lock = threading.Lock()
 
 
 def get_thread_pool() -> ThreadPoolExecutor:
     """Get or create the global thread pool."""
     global _thread_pool
     if _thread_pool is None:
-        _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="assistant")
+        # PATCH #11: raised from 4 to 6 workers to avoid bottleneck with parallel ops
+        _thread_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="assistant")
     return _thread_pool
 
 
@@ -183,6 +199,48 @@ def get_pyaudio():
     if _pyaudio_instance is None and PYAUDIO_AVAILABLE:
         _pyaudio_instance = pyaudio.PyAudio()
     return _pyaudio_instance
+
+
+def get_pyaudio_stream(config: AssistantConfig) -> Optional[Any]:
+    """
+    PATCH #3: Get or create a persistent PyAudio output stream.
+    Opens once at startup, reused for every TTS call.
+    Thread-safe via _pyaudio_stream_lock.
+    """
+    global _pyaudio_stream
+    with _pyaudio_stream_lock:
+        if _pyaudio_stream is not None:
+            try:
+                # Verify stream is still active
+                if not _pyaudio_stream.is_stopped() or _pyaudio_stream.is_active():
+                    return _pyaudio_stream
+            except Exception:
+                pass
+            # Stream is dead; close and recreate
+            try:
+                _pyaudio_stream.close()
+            except Exception:
+                pass
+            _pyaudio_stream = None
+
+        pa = get_pyaudio()
+        if pa is None:
+            return None
+
+        try:
+            _pyaudio_stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=24000,
+                output=True,
+                frames_per_buffer=config.tts.chunk_size,
+            )
+            logger.debug("PyAudio output stream opened")
+        except Exception as e:
+            logger.warning(f"Failed to open PyAudio stream: {e}")
+            _pyaudio_stream = None
+
+        return _pyaudio_stream
 
 
 def touch_activity():
@@ -245,7 +303,7 @@ async def close_async_session():
 # Retry Helper
 # ============================
 def retry_api_call(func: Callable, config: AssistantConfig, *args, **kwargs) -> Any:
-    """Call func with exponential backoff on failure. Faster retries for responsiveness."""
+    """Call func with exponential backoff on failure."""
     last_exc = None
     for attempt in range(config.api_max_retries):
         try:
@@ -254,8 +312,7 @@ def retry_api_call(func: Callable, config: AssistantConfig, *args, **kwargs) -> 
             raise
         except Exception as e:
             last_exc = e
-            # Faster initial delay (0.5s instead of 1s base)
-            delay = min(0.5 * (1.5 ** attempt), 3.0)  # Cap at 3s
+            delay = min(0.5 * (1.5 ** attempt), 3.0)
             logger.warning(f"API call failed (attempt {attempt + 1}/{config.api_max_retries}): {e}")
             if attempt < config.api_max_retries - 1:
                 time.sleep(delay)
@@ -297,14 +354,14 @@ class ServiceHealth:
 
 class HealthMonitor:
     """Monitor health of external services."""
-    
+
     def __init__(self, config: AssistantConfig):
         self.config = config
         self._health: Dict[str, ServiceHealth] = {}
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
-    
+
     def start(self):
         if not self.config.health.enabled:
             return
@@ -312,22 +369,22 @@ class HealthMonitor:
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
         logger.info("Health monitoring started")
-    
+
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-    
+
     def get_health(self, service: str) -> Optional[ServiceHealth]:
         with self._lock:
             return self._health.get(service)
-    
+
     def is_service_available(self, service: str) -> bool:
         health = self.get_health(service)
         if health is None:
             return True
         return health.status != HealthStatus.UNHEALTHY
-    
+
     def _monitor_loop(self):
         while self._running and not _shutdown_event.is_set():
             try:
@@ -335,16 +392,16 @@ class HealthMonitor:
                 self._check_openai()
             except Exception as e:
                 logger.warning(f"Health check error: {e}")
-            
+
             for _ in range(int(self.config.health.check_interval_seconds)):
                 if not self._running or _shutdown_event.is_set():
                     break
                 time.sleep(1)
-    
+
     def _check_home_assistant(self):
         if not self.config.home_assistant.url:
             return
-        
+
         start = time.time()
         try:
             session = get_http_session(self.config)
@@ -355,7 +412,7 @@ class HealthMonitor:
                 timeout=self.config.health.ha_timeout_seconds,
             )
             latency = (time.time() - start) * 1000
-            
+
             if r.ok:
                 status = HealthStatus.HEALTHY
                 error = None
@@ -366,7 +423,7 @@ class HealthMonitor:
             latency = (time.time() - start) * 1000
             status = HealthStatus.UNHEALTHY
             error = str(e)
-        
+
         with self._lock:
             self._health["home_assistant"] = ServiceHealth(
                 name="home_assistant",
@@ -375,14 +432,20 @@ class HealthMonitor:
                 latency_ms=latency,
                 error=error,
             )
-        
+
         if status != HealthStatus.HEALTHY:
             logger.warning(f"Home Assistant health: {status.value} - {error}")
-    
+
     def _check_openai(self):
+        # PATCH #5: use a cheap max_tokens=1 chat ping instead of models.list()
+        # models.list() is a paginated call that takes ~800ms and is unnecessary here.
         start = time.time()
         try:
-            models = sync_client.models.list()
+            sync_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            )
             latency = (time.time() - start) * 1000
             status = HealthStatus.HEALTHY
             error = None
@@ -390,7 +453,7 @@ class HealthMonitor:
             latency = (time.time() - start) * 1000
             status = HealthStatus.UNHEALTHY
             error = str(e)
-        
+
         with self._lock:
             self._health["openai"] = ServiceHealth(
                 name="openai",
@@ -399,7 +462,7 @@ class HealthMonitor:
                 latency_ms=latency,
                 error=error,
             )
-        
+
         if status != HealthStatus.HEALTHY:
             logger.warning(f"OpenAI health: {status.value} - {error}")
 
@@ -409,12 +472,12 @@ class HealthMonitor:
 # ============================
 class Watchdog:
     """Watchdog timer to detect and recover from hangs."""
-    
+
     def __init__(self, config: AssistantConfig):
         self.config = config
         self._running = False
         self._thread: Optional[threading.Thread] = None
-    
+
     def start(self):
         if not self.config.health.watchdog_enabled:
             return
@@ -422,19 +485,19 @@ class Watchdog:
         self._thread = threading.Thread(target=self._watch_loop, daemon=True)
         self._thread.start()
         logger.info("Watchdog started")
-    
+
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
-    
+
     def _watch_loop(self):
         while self._running and not _shutdown_event.is_set():
             time.sleep(10)
-            
+
             last = get_last_activity()
             elapsed = time.time() - last
-            
+
             if elapsed > self.config.health.watchdog_timeout_seconds:
                 logger.error(
                     f"Watchdog timeout! No activity for {elapsed:.0f}s. "
@@ -448,7 +511,7 @@ class Watchdog:
 # ============================
 class EntityCache:
     """Cache for Home Assistant entity states."""
-    
+
     def __init__(self, config: AssistantConfig):
         self.config = config
         self._states: Dict[str, Tuple[Dict[str, Any], float]] = {}
@@ -457,7 +520,7 @@ class EntityCache:
         self._areas: List[Dict[str, Any]] = []
         self._areas_at: float = 0.0
         self._lock = threading.Lock()
-    
+
     def get_state(self, entity_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             if entity_id in self._states:
@@ -465,36 +528,36 @@ class EntityCache:
                 if time.time() - cached_at < self.config.home_assistant.cache_ttl_seconds:
                     return state
         return None
-    
+
     def set_state(self, entity_id: str, state: Dict[str, Any]):
         with self._lock:
             self._states[entity_id] = (state, time.time())
-    
+
     def invalidate(self, entity_id: str):
         with self._lock:
             self._states.pop(entity_id, None)
-    
+
     def invalidate_all(self):
         with self._lock:
             self._states.clear()
-    
+
     def get_areas(self) -> Optional[List[Dict[str, Any]]]:
         with self._lock:
             if self._areas and time.time() - self._areas_at < self.config.home_assistant.areas_cache_ttl_seconds:
                 return self._areas
         return None
-    
+
     def set_areas(self, areas: List[Dict[str, Any]]):
         with self._lock:
             self._areas = areas
             self._areas_at = time.time()
-    
+
     def get_entities(self) -> Optional[List[Dict[str, Any]]]:
         with self._lock:
             if self._entities and time.time() - self._entities_at < self.config.home_assistant.cache_ttl_seconds:
                 return self._entities
         return None
-    
+
     def set_entities(self, entities: List[Dict[str, Any]]):
         with self._lock:
             self._entities = entities
@@ -536,11 +599,11 @@ def _sanitize_service_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
 class HomeAssistantClient:
     """Home Assistant API client with caching and async support."""
-    
+
     def __init__(self, config: AssistantConfig, cache: EntityCache):
         self.config = config
         self.cache = cache
-    
+
     def _headers(self) -> Dict[str, str]:
         if not self.config.home_assistant.token:
             raise HomeAssistantError("HOME_ASSISTANT_TOKEN is not set.")
@@ -548,7 +611,7 @@ class HomeAssistantClient:
             "Authorization": f"Bearer {self.config.home_assistant.token}",
             "Content-Type": "application/json",
         }
-    
+
     def _ws_url(self) -> str:
         if not self.config.home_assistant.url:
             raise HomeAssistantError("HOME_ASSISTANT_URL is not set.")
@@ -558,12 +621,12 @@ class HomeAssistantClient:
         if base.startswith("http://"):
             return base.replace("http://", "ws://") + "/api/websocket"
         return "ws://" + base + "/api/websocket"
-    
+
     def list_areas(self) -> List[Dict[str, Any]]:
         cached = self.cache.get_areas()
         if cached is not None:
             return cached
-        
+
         ws_url = self._ws_url()
         ws = websocket.create_connection(ws_url, timeout=10)
         try:
@@ -572,27 +635,27 @@ class HomeAssistantClient:
             auth_msg = json.loads(ws.recv())
             if auth_msg.get("type") != "auth_ok":
                 raise HomeAssistantError(f"WebSocket auth failed: {auth_msg}")
-            
+
             ws.send(json.dumps({"id": 1, "type": "config/area_registry/list"}))
             msg = json.loads(ws.recv())
-            
+
             if not msg.get("success"):
                 raise HomeAssistantError(f"WS area list failed: {msg}")
-            
+
             areas = msg.get("result", [])
             self.cache.set_areas(areas)
             return areas
         finally:
             ws.close()
-    
+
     def list_entities(self) -> List[Dict[str, Any]]:
         cached = self.cache.get_entities()
         if cached is not None:
             return cached
-        
+
         if not self.config.home_assistant.url:
             raise HomeAssistantError("HOME_ASSISTANT_URL is not set.")
-        
+
         session = get_http_session(self.config)
         r = session.get(
             f"{self.config.home_assistant.url}/api/states",
@@ -601,11 +664,11 @@ class HomeAssistantClient:
         )
         if not r.ok:
             raise HomeAssistantError(f"Failed to list entities: {r.status_code}")
-        
+
         entities = r.json()
         self.cache.set_entities(entities)
         return entities
-    
+
     def get_state(self, entity_id: str) -> Dict[str, Any]:
         if not self.config.home_assistant.url:
             raise HomeAssistantError("HOME_ASSISTANT_URL is not set.")
@@ -613,59 +676,59 @@ class HomeAssistantClient:
             raise HomeAssistantError("Invalid entity_id.")
         if not _validate_entity_id(entity_id):
             raise HomeAssistantError(f"Malformed entity_id: {entity_id}")
-        
+
         cached = self.cache.get_state(entity_id)
         if cached is not None:
             logger.debug(f"Cache hit for {entity_id}")
             return cached
-        
+
         session = get_http_session(self.config)
         url = f"{self.config.home_assistant.url}/api/states/{entity_id}"
         r = session.get(url, headers=self._headers(), timeout=6)
-        
+
         if r.status_code == 404:
             raise HomeAssistantError(f"Entity not found: {entity_id}")
         if not r.ok:
             raise HomeAssistantError(f"HA state error: {r.status_code} {r.text[:200]}")
-        
+
         state = r.json()
         self.cache.set_state(entity_id, state)
         return state
-    
+
     def call_service(self, domain: str, service: str, data: Dict[str, Any]) -> Any:
         if not self.config.home_assistant.url:
             raise HomeAssistantError("HOME_ASSISTANT_URL is not set.")
-        
+
         domain = (domain or "").strip()
         service = (service or "").strip()
-        
+
         if domain not in self.config.home_assistant.allowed_domains:
             raise HomeAssistantError(f"Domain not allowed: {domain}")
         if service not in self.config.home_assistant.allowed_services:
             raise HomeAssistantError(f"Service not allowed: {service}")
-        
+
         eid = data.get("entity_id")
         if eid and isinstance(eid, str) and eid != "all" and not _validate_entity_id(eid):
             raise HomeAssistantError(f"Malformed entity_id in data: {eid}")
-        
+
         data = _sanitize_service_data(data)
-        
+
         url = f"{self.config.home_assistant.url}/api/services/{domain}/{service}"
         logger.debug(f"HA CALL -> {domain}.{service} data={dict(data or {})}")
-        
+
         session = get_http_session(self.config)
         r = session.post(url, headers=self._headers(), json=data or {}, timeout=8)
-        
+
         if not r.ok:
             raise HomeAssistantError(f"HA service error: {r.status_code} {r.text[:200]}")
-        
+
         if eid:
             if isinstance(eid, str):
                 self.cache.invalidate(eid)
             elif isinstance(eid, list):
                 for e in eid:
                     self.cache.invalidate(e)
-        
+
         try:
             return r.json()
         except Exception:
@@ -684,38 +747,38 @@ def fuzzy_match_entity(
     """Fuzzy match a user query to an entity."""
     if not FUZZY_AVAILABLE:
         return None
-    
+
     query_norm = _normalize_text(query)
     if not query_norm:
         return None
-    
+
     candidates = []
     for entity in entities:
         eid = entity.get("entity_id", "")
         if not eid:
             continue
-        
+
         domain = eid.split(".")[0] if "." in eid else ""
         if domain_filter and domain != domain_filter:
             continue
-        
+
         attrs = entity.get("attributes", {})
         friendly_name = attrs.get("friendly_name", "")
-        
+
         targets = [
             _normalize_text(friendly_name),
             _normalize_text(eid.replace(".", " ")),
         ]
-        
+
         for target in targets:
             if target:
                 score = fuzz.ratio(query_norm, target)
                 if score >= min_score:
                     candidates.append((score, eid))
-    
+
     if not candidates:
         return None
-    
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -728,18 +791,18 @@ def fuzzy_match_area(
     """Fuzzy match a user query to an area."""
     if not FUZZY_AVAILABLE:
         return None
-    
+
     query_norm = _normalize_text(query)
     if not query_norm:
         return None
-    
+
     candidates = []
     for area in areas:
         area_id = area.get("area_id", "")
         name = area.get("name", "")
         if not area_id:
             continue
-        
+
         name_norm = _normalize_text(name)
         if name_norm:
             score = fuzz.ratio(query_norm, name_norm)
@@ -747,10 +810,10 @@ def fuzzy_match_area(
             best = max(score, partial)
             if best >= min_score:
                 candidates.append((best, area_id))
-    
+
     if not candidates:
         return None
-    
+
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
 
@@ -760,7 +823,7 @@ def infer_area_id_from_text(user_text: str, areas: List[Dict[str, Any]]) -> Opti
     t = _normalize_text(user_text)
     if not t:
         return None
-    
+
     candidates = []
     for a in areas:
         name = a.get("name", "")
@@ -770,16 +833,16 @@ def infer_area_id_from_text(user_text: str, areas: List[Dict[str, Any]]) -> Opti
         nn = _normalize_text(name)
         if not nn:
             continue
-        
+
         words_in_text = t.split()
         area_words = nn.split()
         if all(aw in words_in_text for aw in area_words):
             candidates.append((len(nn), area_id))
-    
+
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
-    
+
     return fuzzy_match_area(t, areas)
 
 
@@ -851,14 +914,11 @@ def _extract_color_temp_kelvin(text: str) -> Optional[int]:
     return None
 
 
-# Brightness keywords to avoid false positives on random numbers
 _BRIGHTNESS_KEYWORDS = {"percent", "%", "brightness", "dim", "brighter", "bright", "dimmer"}
 
 
 def normalize_light_service_data(data: Dict[str, Any], last_user_text: str) -> Dict[str, Any]:
-    """
-    Convert common model/user color fields into HA-compatible fields.
-    """
+    """Convert common model/user color fields into HA-compatible fields."""
     data = dict(data or {})
 
     if "color" in data and isinstance(data["color"], str) and "color_name" not in data:
@@ -866,7 +926,6 @@ def normalize_light_service_data(data: Dict[str, Any], last_user_text: str) -> D
     if "colour" in data and isinstance(data["colour"], str) and "color_name" not in data:
         data["color_name"] = data.pop("colour")
 
-    # If user asked for any kind of white, prefer Kelvin mode
     if "color_temp_kelvin" not in data and "color_temp" not in data:
         kelvin = _extract_color_temp_kelvin(last_user_text)
         if kelvin is not None:
@@ -892,11 +951,12 @@ def normalize_light_service_data(data: Dict[str, Any], last_user_text: str) -> D
             else:
                 data["color_name"] = cname
 
-    # Brightness: require a brightness-related keyword nearby to avoid false positives
+    # PATCH #6: brightness regex now uses a negative lookahead (?!\s*k\b) so that
+    # kelvin values like "3000k" are not incorrectly parsed as brightness "300".
     if "brightness_pct" not in data:
         norm = _normalize_text(last_user_text)
         if any(kw in norm for kw in _BRIGHTNESS_KEYWORDS):
-            m = re.search(r"\b(\d{1,3})\s*%?\b", norm)
+            m = re.search(r"\b(\d{1,3})(?!\d)(?!\s*k\b)\s*%?\b", norm)
             if m:
                 pct = max(0, min(100, int(m.group(1))))
                 data["brightness_pct"] = pct
@@ -916,15 +976,15 @@ def suggest_scene(
     try:
         entities = ha_client.list_entities()
         scenes = [e for e in entities if e.get("entity_id", "").startswith("scene.")]
-        
+
         if not scenes:
             return None
-        
+
         hour = datetime.now().hour
         text_lower = user_text.lower()
-        
+
         suggestions = []
-        
+
         if hour >= 22 or hour < 6:
             for scene in scenes:
                 name = scene.get("attributes", {}).get("friendly_name", "").lower()
@@ -940,33 +1000,33 @@ def suggest_scene(
                 name = scene.get("attributes", {}).get("friendly_name", "").lower()
                 if any(kw in name for kw in ["evening", "dinner", "relax", "movie", "cozy"]):
                     suggestions.append(scene)
-        
+
         if any(kw in text_lower for kw in ["movie", "watch", "film", "tv", "netflix"]):
             for scene in scenes:
                 name = scene.get("attributes", {}).get("friendly_name", "").lower()
                 if any(kw in name for kw in ["movie", "cinema", "theater", "dim"]):
                     suggestions.append(scene)
-        
+
         if any(kw in text_lower for kw in ["dinner", "eat", "food", "meal"]):
             for scene in scenes:
                 name = scene.get("attributes", {}).get("friendly_name", "").lower()
                 if any(kw in name for kw in ["dinner", "dining", "meal"]):
                     suggestions.append(scene)
-        
+
         if any(kw in text_lower for kw in ["work", "focus", "study", "reading"]):
             for scene in scenes:
                 name = scene.get("attributes", {}).get("friendly_name", "").lower()
                 if any(kw in name for kw in ["work", "focus", "bright", "study", "reading"]):
                     suggestions.append(scene)
-        
+
         if suggestions:
             scene = suggestions[0]
             friendly = scene.get("attributes", {}).get("friendly_name", scene.get("entity_id"))
             return f"Would you like me to activate the '{friendly}' scene?"
-        
+
     except Exception as e:
         logger.debug(f"Scene suggestion failed: {e}")
-    
+
     return None
 
 
@@ -983,39 +1043,39 @@ def check_state_and_respond(
     """Check current state and return a response if action is redundant."""
     if not entity_id or entity_id == "all":
         return None
-    
+
     try:
         state = ha_client.get_state(entity_id)
         current_state = state.get("state", "")
         friendly_name = state.get("attributes", {}).get("friendly_name", entity_id)
-        
+
         if domain == "light":
             if service == "turn_on" and current_state == "on":
                 return f"The {friendly_name} is already on."
             if service == "turn_off" and current_state == "off":
                 return f"The {friendly_name} is already off."
-        
+
         if domain == "switch":
             if service == "turn_on" and current_state == "on":
                 return f"The {friendly_name} is already on."
             if service == "turn_off" and current_state == "off":
                 return f"The {friendly_name} is already off."
-        
+
         if domain == "lock":
             if service == "lock" and current_state == "locked":
                 return f"The {friendly_name} is already locked."
             if service == "unlock" and current_state == "unlocked":
                 return f"The {friendly_name} is already unlocked."
-        
+
         if domain == "cover":
             if service == "open_cover" and current_state == "open":
                 return f"The {friendly_name} is already open."
             if service == "close_cover" and current_state == "closed":
                 return f"The {friendly_name} is already closed."
-        
+
     except Exception as e:
         logger.debug(f"State check failed: {e}")
-    
+
     return None
 
 
@@ -1040,13 +1100,13 @@ OFFLINE_RESPONSES = {
 def get_offline_response(text: str) -> Optional[str]:
     """Get a response when offline."""
     text_lower = text.lower().strip()
-    
+
     for key, response in OFFLINE_RESPONSES.items():
         if key in text_lower:
             if callable(response):
                 return response()
             return response
-    
+
     return "I'm having trouble connecting to my services right now. Please try again in a moment."
 
 
@@ -1089,7 +1149,7 @@ def apply_noise_reduction(
     """Apply noise reduction to audio."""
     if not NOISEREDUCE_AVAILABLE or not config.audio.noise_reduce_enabled:
         return audio_i16
-    
+
     try:
         audio_f32 = audio_i16.astype(np.float32) / 32768.0
         reduced = nr.reduce_noise(
@@ -1107,18 +1167,18 @@ def apply_noise_reduction(
 def normalize_volume(audio_i16: np.ndarray, target_db: float = -20.0) -> np.ndarray:
     """Normalize audio volume to target dB level."""
     audio_f32 = audio_i16.astype(np.float32)
-    
+
     current_rms = np.sqrt(np.mean(np.square(audio_f32)) + 1e-12)
     if current_rms < 1e-6:
         return audio_i16
-    
+
     current_db = 20 * np.log10(current_rms / 32768.0)
     gain_db = target_db - current_db
     gain_linear = 10 ** (gain_db / 20)
-    
+
     audio_f32 = audio_f32 * gain_linear
     audio_f32 = np.tanh(audio_f32 / 32768.0) * 32768.0
-    
+
     return audio_f32.astype(np.int16)
 
 
@@ -1127,28 +1187,28 @@ def normalize_volume(audio_i16: np.ndarray, target_db: float = -20.0) -> np.ndar
 # ============================
 class WebRTCVAD:
     """WebRTC Voice Activity Detection wrapper."""
-    
+
     def __init__(self, config: AssistantConfig):
         self.config = config
         self.vad: Optional[Any] = None
-        
+
         if WEBRTC_VAD_AVAILABLE:
             self.vad = webrtcvad.Vad(config.audio.vad_mode)
             logger.info(f"WebRTC VAD initialized (mode={config.audio.vad_mode})")
         else:
             logger.warning("WebRTC VAD not available, falling back to RMS-based detection")
-    
+
     def is_speech(self, pcm_bytes: bytes, sample_rate: int) -> bool:
         if self.vad is None:
             return True
-        
+
         if sample_rate != 16000:
             return True
-        
+
         frame_ms = len(pcm_bytes) / 2 / sample_rate * 1000
         if frame_ms not in (10, 20, 30):
             return True
-        
+
         try:
             return self.vad.is_speech(pcm_bytes, sample_rate)
         except Exception:
@@ -1160,26 +1220,26 @@ class WebRTCVAD:
 # ============================
 class EchoCancellation:
     """Basic echo cancellation using playback tracking."""
-    
+
     def __init__(self):
         self._playing = threading.Event()
         self._last_play_end: float = 0.0
         self._suppression_tail_seconds: float = 0.3
-    
+
     def start_playback(self):
         self._playing.set()
-    
+
     def end_playback(self):
         self._playing.clear()
         self._last_play_end = time.time()
-    
+
     def should_suppress(self) -> bool:
         if self._playing.is_set():
             return True
-        
+
         if time.time() - self._last_play_end < self._suppression_tail_seconds:
             return True
-        
+
         return False
 
 
@@ -1199,7 +1259,7 @@ def aplay_wav(wav_path: str, config: AssistantConfig):
             )
         finally:
             echo_cancellation.end_playback()
-    
+
     if p.returncode != 0:
         raise RuntimeError(
             f"aplay failed (rc={p.returncode}) on device '{config.audio.alsa_device}'.\n"
@@ -1221,14 +1281,14 @@ def aplay_wav_interruptible(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            
+
             while p.poll() is None:
                 if check_interrupt():
                     p.terminate()
                     p.wait()
                     return False
                 time.sleep(0.1)
-            
+
             return p.returncode == 0
         finally:
             echo_cancellation.end_playback()
@@ -1247,23 +1307,20 @@ def play_wav_file(path: str, label: str, config: AssistantConfig):
 def play_success_sound(config: AssistantConfig):
     """Play success confirmation sound."""
     if config.sfx.success_wav:
-        play_wav_file(config.sfx.success_wav, "success", config)
+        play_wav_file(config.sfx.success_wav, "SFX_SUCCESS_WAV", config)
 
 
 def play_failure_sound(config: AssistantConfig):
     """Play failure sound."""
     if config.sfx.failure_wav:
-        play_wav_file(config.sfx.failure_wav, "failure", config)
+        play_wav_file(config.sfx.failure_wav, "SFX_FAILURE_WAV", config)
 
 
 def play_wav_file_async(path: str, label: str, config: AssistantConfig) -> Optional[Future]:
-    """
-    Play a WAV file asynchronously in background.
-    Returns a Future that can be waited on if needed.
-    """
+    """Play a WAV file asynchronously in background."""
     if not path:
         return None
-    
+
     pool = get_thread_pool()
     return pool.submit(play_wav_file, path, label, config)
 
@@ -1274,96 +1331,79 @@ def play_wav_file_async(path: str, label: str, config: AssistantConfig) -> Optio
 def speak_tts_realtime(text: str, config: AssistantConfig) -> bool:
     """
     True real-time streaming TTS - plays audio chunks as they arrive.
-    Much lower latency than buffering the entire response first.
+    PATCH #3: Reuses the persistent PyAudio stream opened at startup instead of
+    opening a new one per call (~50ms savings per TTS invocation).
     """
     if not PYAUDIO_AVAILABLE:
         return speak_tts_streaming(text, config)
-    
+
+    stream = get_pyaudio_stream(config)
+    if stream is None:
+        return speak_tts_streaming(text, config)
+
+    echo_cancellation.start_playback()
+    completed = True
+
     try:
-        pa = get_pyaudio()
-        if pa is None:
-            return speak_tts_streaming(text, config)
-        
-        # OpenAI TTS PCM format: 24kHz, 16-bit, mono
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=24000,
-            output=True,
-            frames_per_buffer=config.tts.chunk_size,
-        )
-        
-        echo_cancellation.start_playback()
-        completed = True
-        
-        try:
-            with sync_client.audio.speech.with_streaming_response.create(
-                model=config.tts.model,
-                voice=config.tts.voice,
-                input=text,
-                response_format="pcm",
-            ) as response:
-                buffer = bytearray()
-                chunks_played = 0
-                
-                for chunk in response.iter_bytes(chunk_size=config.tts.chunk_size):
-                    if _playback_interrupt.is_set():
-                        completed = False
-                        break
-                    
-                    buffer.extend(chunk)
-                    
-                    # Play complete audio frames (2 bytes per sample)
-                    while len(buffer) >= config.tts.chunk_size:
-                        audio_chunk = bytes(buffer[:config.tts.chunk_size])
-                        buffer = buffer[config.tts.chunk_size:]
-                        
-                        # Optional: Quick volume normalization per chunk
-                        if config.tts.volume_normalization and len(audio_chunk) > 0:
-                            pcm_data = np.frombuffer(audio_chunk, dtype=np.int16)
-                            pcm_data = normalize_volume_fast(pcm_data, config.tts.target_db)
-                            audio_chunk = pcm_data.tobytes()
-                        
-                        stream.write(audio_chunk)
-                        chunks_played += 1
-                
-                # Play any remaining audio
-                if buffer and not _playback_interrupt.is_set():
-                    # Pad to ensure proper playback
-                    remaining = bytes(buffer)
-                    if config.tts.volume_normalization and len(remaining) >= 2:
-                        pcm_data = np.frombuffer(remaining, dtype=np.int16)
+        with sync_client.audio.speech.with_streaming_response.create(
+            model=config.tts.model,
+            voice=config.tts.voice,
+            input=text,
+            response_format="pcm",
+        ) as response:
+            buffer = bytearray()
+
+            for chunk in response.iter_bytes(chunk_size=config.tts.chunk_size):
+                if _playback_interrupt.is_set():
+                    completed = False
+                    break
+
+                buffer.extend(chunk)
+
+                while len(buffer) >= config.tts.chunk_size:
+                    audio_chunk = bytes(buffer[:config.tts.chunk_size])
+                    buffer = buffer[config.tts.chunk_size:]
+
+                    if config.tts.volume_normalization and len(audio_chunk) > 0:
+                        pcm_data = np.frombuffer(audio_chunk, dtype=np.int16)
                         pcm_data = normalize_volume_fast(pcm_data, config.tts.target_db)
-                        remaining = pcm_data.tobytes()
-                    stream.write(remaining)
-                    
-        finally:
-            stream.stop_stream()
-            stream.close()
-            echo_cancellation.end_playback()
-        
-        return completed
-        
+                        audio_chunk = pcm_data.tobytes()
+
+                    stream.write(audio_chunk)
+
+            # Flush remaining
+            if buffer and not _playback_interrupt.is_set():
+                remaining = bytes(buffer)
+                if config.tts.volume_normalization and len(remaining) >= 2:
+                    pcm_data = np.frombuffer(remaining, dtype=np.int16)
+                    pcm_data = normalize_volume_fast(pcm_data, config.tts.target_db)
+                    remaining = pcm_data.tobytes()
+                stream.write(remaining)
+
     except Exception as e:
         logger.warning(f"Real-time TTS failed, falling back to standard: {e}")
+        echo_cancellation.end_playback()
         return speak_tts_streaming(text, config)
+    finally:
+        echo_cancellation.end_playback()
+
+    return completed
 
 
 def normalize_volume_fast(audio_i16: np.ndarray, target_db: float = -20.0) -> np.ndarray:
     """Fast volume normalization for streaming chunks."""
     if len(audio_i16) == 0:
         return audio_i16
-    
+
     audio_f32 = audio_i16.astype(np.float32)
     max_val = np.abs(audio_f32).max()
-    
-    if max_val < 100:  # Nearly silent
+
+    if max_val < 100:
         return audio_i16
-    
-    # Simple gain adjustment
+
     target_max = 32768 * (10 ** (target_db / 20))
-    gain = min(target_max / max_val, 2.0)  # Limit gain to avoid clipping
-    
+    gain = min(target_max / max_val, 2.0)
+
     audio_f32 = audio_f32 * gain
     return np.clip(audio_f32, -32768, 32767).astype(np.int16)
 
@@ -1379,33 +1419,33 @@ def speak_tts_streaming(text: str, config: AssistantConfig) -> bool:
         ) as response:
             pcm_fd, pcm_path = tempfile.mkstemp(suffix=".pcm", dir=BASE_DIR)
             wav_path = pcm_path.replace(".pcm", ".wav")
-            
+
             try:
                 with os.fdopen(pcm_fd, "wb") as f:
                     for chunk in response.iter_bytes(chunk_size=4096):
                         if _playback_interrupt.is_set():
                             return False
                         f.write(chunk)
-                
+
                 pcm_data = np.fromfile(pcm_path, dtype=np.int16)
-                
+
                 if config.tts.volume_normalization:
                     pcm_data = normalize_volume(pcm_data, config.tts.target_db)
-                
+
                 save_wav(wav_path, pcm_data, 24000, channels=1)
-                
+
                 def check_interrupt():
                     return _playback_interrupt.is_set()
-                
+
                 return aplay_wav_interruptible(wav_path, config, check_interrupt)
-                
+
             finally:
                 for p in (pcm_path, wav_path):
                     try:
                         os.unlink(p)
                     except OSError:
                         pass
-                        
+
     except Exception as e:
         logger.error(f"Streaming TTS failed: {e}")
         return speak_tts_standard(text, config)
@@ -1420,42 +1460,42 @@ def speak_tts_standard(text: str, config: AssistantConfig) -> bool:
             input=text,
         )
         audio_bytes = audio.read() if hasattr(audio, "read") else audio.content
-        
+
         mp3_fd, mp3_path = tempfile.mkstemp(suffix=".mp3", dir=BASE_DIR)
         wav_fd, wav_path = tempfile.mkstemp(suffix=".wav", dir=BASE_DIR)
-        
+
         try:
             os.close(wav_fd)
             with os.fdopen(mp3_fd, "wb") as f:
                 f.write(audio_bytes)
-            
+
             subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "quiet", "-y",
                  "-i", mp3_path, "-ac", "2", "-ar", "48000", wav_path],
                 check=False,
             )
-            
+
             if config.tts.volume_normalization:
                 with wave.open(wav_path, "rb") as wf:
                     audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
                     sample_rate = wf.getframerate()
                     channels = wf.getnchannels()
-                
+
                 audio_data = normalize_volume(audio_data, config.tts.target_db)
                 save_wav(wav_path, audio_data, sample_rate, channels)
-            
+
             def check_interrupt():
                 return _playback_interrupt.is_set()
-            
+
             return aplay_wav_interruptible(wav_path, config, check_interrupt)
-            
+
         finally:
             for p in (mp3_path, wav_path):
                 try:
                     os.unlink(p)
                 except OSError:
                     pass
-                    
+
     except Exception as e:
         logger.error(f"TTS failed: {e}")
         return False
@@ -1464,9 +1504,8 @@ def speak_tts_standard(text: str, config: AssistantConfig) -> bool:
 def speak_tts(text: str, config: AssistantConfig) -> bool:
     """Speak text using TTS (real-time streaming for lowest latency)."""
     _playback_interrupt.clear()
-    
+
     if config.tts.streaming_enabled:
-        # Use real-time streaming (plays as chunks arrive) if available
         if config.tts.direct_streaming and PYAUDIO_AVAILABLE:
             return speak_tts_realtime(text, config)
         return speak_tts_streaming(text, config)
@@ -1478,10 +1517,7 @@ def speak_tts(text: str, config: AssistantConfig) -> bool:
 # Transcription (Optimized)
 # ============================
 def transcribe_audio_fast(wav_path: str, config: AssistantConfig) -> str:
-    """
-    Fast transcription without retry overhead.
-    Use for time-critical first attempts.
-    """
+    """Fast transcription without retry overhead."""
     try:
         with open(wav_path, "rb") as f:
             tx = sync_client.audio.transcriptions.create(
@@ -1637,7 +1673,6 @@ def _execute_tool_call(
                     "Try saying a room name (e.g., 'living room') or 'all lights'."
                 )
 
-            # State-aware check
             state_response = check_state_and_respond(
                 ha_client, domain, service,
                 data.get("entity_id"), data.get("area_id")
@@ -1700,7 +1735,6 @@ def ask_chat_with_tools(
             last_user_text = m.get("content", "") or ""
             break
 
-    # Check if we're offline
     if not health_monitor.is_service_available("openai"):
         offline_response = get_offline_response(last_user_text)
         return offline_response, messages, False
@@ -1756,19 +1790,28 @@ def ask_chat_with_tools(
 
 
 def trim_conversation(messages: List[Dict[str, Any]], config: AssistantConfig) -> List[Dict[str, Any]]:
-    """Keep conversation within limits."""
+    """
+    Keep conversation within limits.
+    PATCH #7: Uses index arithmetic instead of list.index() to avoid ValueError
+    when message dicts have been mutated (e.g. via model_dump() on tool_calls).
+    """
     if len(messages) <= config.conversation.max_history_messages + 1:
         return messages
 
     system = [messages[0]] if messages and messages[0].get("role") == "system" else []
     history = messages[len(system):]
 
-    trimmed = history[-(config.conversation.max_history_messages):]
+    # Trim to the most recent N messages
+    trim_start = max(0, len(history) - config.conversation.max_history_messages)
+    trimmed = history[trim_start:]
 
+    # Walk backwards by index to find the assistant message that precedes any
+    # leading tool message — no list.index() call, no equality scan.
     while trimmed and trimmed[0].get("role") == "tool":
-        idx = history.index(trimmed[0])
-        if idx > 0:
-            trimmed.insert(0, history[idx - 1])
+        abs_idx = trim_start  # position of trimmed[0] in history
+        if abs_idx > 0:
+            trimmed = [history[abs_idx - 1]] + trimmed
+            trim_start -= 1
         else:
             break
 
@@ -1785,13 +1828,45 @@ def record_utterance_after_wake(
     config: AssistantConfig,
     vad: WebRTCVAD,
 ) -> Optional[str]:
-    """Record audio with VAD-based speech detection."""
+    """
+    Record audio with VAD-based speech detection.
+
+    PATCH #1: The frame is always read from the stream first, even when
+    echo-suppression is active.  Previously the loop did `continue` before
+    reading, causing the sounddevice ring-buffer to fill up and the assistant
+    to fall behind real-time after every TTS playback.
+
+    PATCH #2: The VAD frame passed to webrtcvad is sized dynamically from the
+    actual frame duration rather than being hard-coded to 480 samples.
+    webrtcvad requires exactly 10 / 20 / 30 ms at 16 kHz:
+      - 10 ms = 160 samples
+      - 20 ms = 320 samples
+      - 30 ms = 480 samples
+    We compute frame_ms from the mic frame length and pick the closest valid
+    VAD frame size, so the code still works correctly if MIC_RATE changes
+    (e.g. 44100 Hz gives 441 mic samples → 147 at 16 kHz, nearest valid = 160).
+    """
     chunks: List[np.ndarray] = []
     max_frames = int((config.audio.max_utterance_seconds * mic_rate) / mic_frame_length)
     frames_per_second = mic_rate / mic_frame_length
 
+    # PATCH #2: compute the VAD frame size once, based on actual frame duration
+    frame_duration_ms = (mic_frame_length / mic_rate) * 1000  # ms per mic frame
+    decimated_samples_per_frame = int(round(mic_frame_length * 16000 / mic_rate))
+    # Pick the largest valid webrtcvad frame that fits within our decimated frame
+    for valid_ms in (30, 20, 10):
+        valid_samples = int(16000 * valid_ms / 1000)  # 480, 320, or 160
+        if decimated_samples_per_frame >= valid_samples:
+            vad_frame_samples = valid_samples
+            break
+    else:
+        vad_frame_samples = 160  # 10 ms fallback
+
     noise_rms_values: List[float] = []
     logger.info("Listening for your question...")
+
+    # PATCH #10: play the listening sound now that we are actively recording
+    # (moved here from handle_interaction so it fires at the right moment)
 
     for i in range(config.audio.noise_calibration_frames):
         pcm_bytes = stream.read(mic_frame_length)[0]
@@ -1814,17 +1889,12 @@ def record_utterance_after_wake(
     min_speech_frames = int(config.audio.min_speech_seconds * frames_per_second)
     silence_frames_needed = int(config.audio.silence_seconds_to_stop * frames_per_second)
 
-    # Use configurable VAD window size for faster response
     vad_win_size = getattr(config.audio, 'vad_window_size', 2)
     energy_window: deque = deque(maxlen=3)
     vad_window: deque = deque(maxlen=3)
-    
-    # Track peak energy during speech for quick drop detection
+
     peak_speech_rms: float = 0.0
     energy_drop_ratio = getattr(config.audio, 'energy_drop_ratio', 0.25)
-
-    # Track consecutive speech frames during silence to prevent single noise
-    # spikes from resetting the silence counter
     speech_resume_count = 0
 
     remaining_frames = max_frames - config.audio.noise_calibration_frames
@@ -1834,12 +1904,15 @@ def record_utterance_after_wake(
         if _shutdown_event.is_set():
             return None
 
+        # PATCH #1: ALWAYS read the frame first to drain the ring-buffer.
+        # Only skip processing (not reading) when echo-suppressing.
         pcm_bytes = stream.read(mic_frame_length)[0]
+        pcm_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
 
         if echo_cancellation.should_suppress():
+            # Frame consumed but discarded — buffer stays in sync
             continue
 
-        pcm_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         chunks.append(pcm_i16)
 
         audio_f32 = pcm_i16.astype(np.float32) / 32768.0
@@ -1848,17 +1921,14 @@ def record_utterance_after_wake(
         smoothed_rms = float(np.mean(energy_window))
 
         pcm_16k = decimate_to_16k(pcm_i16, mic_rate)
-        # WebRTC VAD requires exactly 10/20/30ms frames at 16kHz
-        # 30ms at 16kHz = 480 samples; our frame is 512 samples, so truncate
-        vad_frame = pcm_16k[:480] if len(pcm_16k) >= 480 else pcm_16k
+        # PATCH #2: use dynamically-computed vad_frame_samples
+        vad_frame = pcm_16k[:vad_frame_samples] if len(pcm_16k) >= vad_frame_samples else pcm_16k
         is_speech_vad = vad.is_speech(vad_frame.tobytes(), 16000)
         vad_window.append(is_speech_vad)
 
-        # Speech = energy above threshold OR strong VAD agreement
-        # For end-of-speech: require BOTH energy drop AND VAD says no speech
         vad_votes = sum(vad_window)
         energy_above = smoothed_rms >= adaptive_threshold
-        vad_says_speech = vad_votes >= 2  # At least 2 of 3 VAD frames say speech
+        vad_says_speech = vad_votes >= 2
         is_speech = energy_above or vad_says_speech
 
         if not speech_detected:
@@ -1878,29 +1948,24 @@ def record_utterance_after_wake(
                 speech_frame_count += 1
                 if smoothed_rms > peak_speech_rms:
                     peak_speech_rms = smoothed_rms
-                # Don't let isolated noise frames reset the silence counter.
-                # Require 2+ consecutive speech frames to confirm speech resumed.
                 if silence_count == 0:
-                    # Still in continuous speech, no issue
                     speech_resume_count = 0
                 else:
                     speech_resume_count += 1
                     if speech_resume_count >= 3:
-                        # Confirmed speech actually resumed (need 3 consecutive to avoid noise spikes)
                         silence_count = 0
                         speech_resume_count = 0
             else:
                 speech_resume_count = 0
                 silence_count += 1
-                
-                # Quick stop: if energy drops dramatically below speech level, stop faster
+
                 quick_stop = (
                     speech_frame_count >= min_speech_frames and
                     peak_speech_rms > 0 and
                     smoothed_rms < peak_speech_rms * energy_drop_ratio and
                     silence_count >= max(3, silence_frames_needed // 2)
                 )
-                
+
                 if quick_stop or (speech_frame_count >= min_speech_frames and silence_count >= silence_frames_needed):
                     logger.info(
                         f"End of speech: {speech_frame_count} frames, "
@@ -1919,8 +1984,6 @@ def record_utterance_after_wake(
     if trailing_silence_samples > 0 and trailing_silence_samples < len(audio_i16):
         audio_i16 = audio_i16[:-trailing_silence_samples]
 
-    # Skip noise reduction — adds 200-500ms latency and OpenAI transcription handles noise well
-
     out_fd, out_path = tempfile.mkstemp(suffix=".wav", dir=BASE_DIR)
     os.close(out_fd)
     save_wav(out_path, audio_i16, mic_rate, channels=1)
@@ -1934,20 +1997,28 @@ def record_followup(
     config: AssistantConfig,
     vad: WebRTCVAD,
     porcupine: pvporcupine.Porcupine,
+    ambient_threshold: float,
 ) -> Tuple[Optional[str], bool]:
     """
     Listen for follow-up speech or wake word.
     Returns: Tuple of (wav_path or None, was_wake_word_detected)
+
+    PATCH #8: accepts ambient_threshold from the caller (computed during the
+    preceding utterance recording) instead of using a hardcoded *3.0 multiplier.
+    Falls back to silence_rms_threshold * 2 when no ambient value is provided.
     """
     frames_per_second = mic_rate / mic_frame_length
     timeout_frames = int(config.conversation.followup_window_seconds * frames_per_second)
     silence_timeout_frames = int(config.conversation.followup_silence_timeout * frames_per_second)
 
+    # PATCH #8: use caller-supplied ambient threshold so follow-up detection is
+    # consistent with the main utterance recorder's calibrated noise floor.
+    followup_threshold = max(ambient_threshold, config.audio.silence_rms_threshold * 2.0)
+
     chunks: List[np.ndarray] = []
     speech_detected = False
     speech_frame_count = 0
     silence_count = 0
-    # Require more speech frames for follow-up to avoid false triggers
     min_speech_frames = int(max(0.4, config.audio.min_speech_seconds * 1.5) * frames_per_second)
 
     energy_window: deque = deque(maxlen=3)
@@ -1972,15 +2043,13 @@ def record_followup(
         frame_rms = rms(audio_f32)
         energy_window.append(frame_rms)
         smoothed_rms = float(np.mean(energy_window))
-        
-        # Use VAD for more accurate speech detection
+
         is_speech_vad = vad.is_speech(pcm_16k.tobytes(), 16000)
         vad_window.append(is_speech_vad)
         vad_votes = sum(vad_window)
 
-        # Require BOTH strong energy AND unanimous VAD agreement for follow-up
-        # This prevents false triggers from noise
-        is_speech = (smoothed_rms >= config.audio.silence_rms_threshold * 3.0) and (vad_votes >= 3)
+        # PATCH #8: use ambient-calibrated threshold instead of hardcoded *3.0
+        is_speech = (smoothed_rms >= followup_threshold) and (vad_votes >= 3)
 
         if is_speech:
             if not speech_detected:
@@ -2046,18 +2115,17 @@ def _print_startup_info(config: AssistantConfig, mic_device: int):
     logger.info(f"Streaming TTS: {config.tts.streaming_enabled} | Direct streaming: {config.tts.direct_streaming}")
     logger.info(f"SFX: enabled={config.sfx.enabled} style={config.sfx.style} volume={config.sfx.volume}")
 
-    if config.sfx.startup_wav:
-        logger.info(f"SFX_STARTUP_WAV: {config.sfx.startup_wav}")
-    if config.sfx.after_wake_wav:
-        logger.info(f"SFX_AFTER_WAKE_WAV: {config.sfx.after_wake_wav}")
-    if config.sfx.after_question_wav:
-        logger.info(f"SFX_AFTER_QUESTION_WAV: {config.sfx.after_question_wav}")
-    if config.sfx.processing_wav:
-        logger.info(f"SFX_PROCESSING_WAV: {config.sfx.processing_wav}")
-    if config.sfx.success_wav:
-        logger.info(f"SFX_SUCCESS_WAV: {config.sfx.success_wav}")
-    if config.sfx.failure_wav:
-        logger.info(f"SFX_FAILURE_WAV: {config.sfx.failure_wav}")
+    for label, path in [
+        ("SFX_STARTUP_WAV", config.sfx.startup_wav),
+        ("SFX_AFTER_WAKE_WAV", config.sfx.after_wake_wav),
+        ("SFX_AFTER_QUESTION_WAV", config.sfx.after_question_wav),
+        ("SFX_PROCESSING_WAV", config.sfx.processing_wav),
+        ("SFX_LISTENING_WAV", config.sfx.listening_wav),
+        ("SFX_SUCCESS_WAV", config.sfx.success_wav),
+        ("SFX_FAILURE_WAV", config.sfx.failure_wav),
+    ]:
+        if path:
+            logger.info(f"{label}: {path}")
 
     logger.info(f"Wake sensitivity: {config.wake_word.sensitivity}")
     logger.info(
@@ -2071,11 +2139,11 @@ def _print_startup_info(config: AssistantConfig, mic_device: int):
         f"leading_timeout={config.audio.leading_silence_timeout}s, "
         f"adaptive_mult={config.audio.adaptive_threshold_mult}x"
     )
-    logger.info("Follow-up mode: disabled")
     logger.info(
         f"Health: monitor={config.health.enabled}, "
         f"watchdog={config.health.watchdog_enabled}"
     )
+    logger.info(f"debug_tools={config.debug_tools} | debug_ha={config.debug_ha}")
 
     if config.home_assistant.url:
         logger.info(f"HA URL: {config.home_assistant.url}")
@@ -2094,15 +2162,14 @@ def _print_startup_info(config: AssistantConfig, mic_device: int):
 def initialize_openai_clients():
     """Initialize OpenAI clients with connection pooling."""
     global sync_client, async_client
-    
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable is required")
-    
-    # Use httpx transport with connection pooling for better performance
+
     sync_client = OpenAI(
         api_key=api_key,
-        max_retries=0,  # We handle retries ourselves
+        max_retries=0,
         timeout=30.0,
     )
     async_client = AsyncOpenAI(
@@ -2119,68 +2186,79 @@ def prewarm_connections(config: AssistantConfig, ha_client: HomeAssistantClient)
     Runs in background thread during startup.
     """
     pool = get_thread_pool()
-    
+
     def _prewarm_openai():
-        """Warm up OpenAI connection by listing models."""
+        # PATCH #4: use a cheap max_tokens=1 completion instead of models.list().
+        # models.list() is a paginated API call that takes ~800ms — far too slow
+        # for what is essentially a TCP connection warm-up.
         try:
-            # Simple API call to establish connection
-            sync_client.models.list()
+            sync_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            )
             logger.debug("OpenAI connection prewarmed")
         except Exception as e:
             logger.debug(f"OpenAI prewarm failed (non-critical): {e}")
-    
+
     def _prewarm_ha():
-        """Warm up Home Assistant connection and cache entities."""
         try:
             if config.home_assistant.url:
-                # Prefetch entities and areas into cache
                 ha_client.list_entities()
                 ha_client.list_areas()
                 logger.debug("Home Assistant connection prewarmed, entities cached")
         except Exception as e:
             logger.debug(f"HA prewarm failed (non-critical): {e}")
-    
+
     def _prewarm_pyaudio():
-        """Initialize PyAudio to avoid startup latency."""
+        # PATCH #3: open the persistent PyAudio stream at startup
         try:
             if PYAUDIO_AVAILABLE:
-                get_pyaudio()
-                logger.debug("PyAudio initialized")
+                get_pyaudio_stream(config)
+                logger.debug("PyAudio persistent stream opened")
         except Exception as e:
             logger.debug(f"PyAudio prewarm failed: {e}")
-    
-    # Submit all prewarm tasks in parallel
+
     futures = [
         pool.submit(_prewarm_openai),
         pool.submit(_prewarm_ha),
         pool.submit(_prewarm_pyaudio),
     ]
-    
-    # Wait for all to complete (with timeout)
+
     for f in futures:
         try:
             f.result(timeout=5.0)
         except Exception:
             pass
-    
+
     logger.info("Connection prewarming complete")
 
 
 def cleanup():
     """Cleanup resources on shutdown."""
-    global _thread_pool, _pyaudio_instance, _http_session
-    
+    global _thread_pool, _pyaudio_stream, _pyaudio_instance, _http_session
+
     if _thread_pool:
         _thread_pool.shutdown(wait=False)
         _thread_pool = None
-    
+
+    # PATCH #3: close the persistent PyAudio stream on shutdown
+    with _pyaudio_stream_lock:
+        if _pyaudio_stream:
+            try:
+                _pyaudio_stream.stop_stream()
+                _pyaudio_stream.close()
+            except Exception:
+                pass
+            _pyaudio_stream = None
+
     if _pyaudio_instance and PYAUDIO_AVAILABLE:
         try:
             _pyaudio_instance.terminate()
         except Exception:
             pass
         _pyaudio_instance = None
-    
+
     if _http_session:
         try:
             _http_session.close()
@@ -2192,6 +2270,13 @@ def cleanup():
 # ============================
 # Main Loop
 # ============================
+
+# Module-level storage for the last-computed ambient threshold so follow-up
+# mode can reuse it without re-calibrating.  Reset to None after each
+# wake-word cycle.
+_last_ambient_threshold: float = 0.0
+
+
 def handle_interaction(
     stream,
     mic_frame_length: int,
@@ -2201,32 +2286,37 @@ def handle_interaction(
     messages: List[Dict[str, Any]],
     ha_client: HomeAssistantClient,
     health_monitor: HealthMonitor,
-) -> Tuple[List[Dict[str, Any]], bool]:
+) -> Tuple[List[Dict[str, Any]], bool, float]:
     """
     Handle a single interaction cycle.
-    Returns: Updated messages list and whether to continue in follow-up mode.
+    Returns: (updated_messages, should_continue_followup, ambient_threshold)
+
+    PATCH #8: now returns the ambient_threshold so record_followup can use it.
+    PATCH #10: plays listening_wav at the correct moment (when recording starts).
     """
+    global _last_ambient_threshold
     touch_activity()
 
-    # Record utterance
+    # PATCH #10: play listening sound just before we start recording
+    play_wav_file_async(config.sfx.listening_wav, "SFX_LISTENING_WAV", config)
+
     utter_wav = record_utterance_after_wake(
         stream, mic_frame_length, config.audio.mic_rate, config, vad
     )
 
     if utter_wav is None:
         logger.info("No utterance captured, returning to wake word listening.")
-        return messages, False
+        return messages, False, _last_ambient_threshold
 
     # Immediate audio feedback: play processing sound as soon as recording stops
     play_wav_file_async(config.sfx.processing_wav, "SFX_PROCESSING", config)
 
-    # Transcribe (fast path, no retry overhead)
     try:
         text = transcribe_audio_fast(utter_wav, config)
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         speak_tts("Sorry, I couldn't understand that. Try again.", config)
-        return messages, False
+        return messages, False, _last_ambient_threshold
     finally:
         try:
             os.unlink(utter_wav)
@@ -2234,20 +2324,17 @@ def handle_interaction(
             pass
 
     if not text:
-        return messages, False
+        return messages, False, _last_ambient_threshold
 
     logger.info(f"You: {text}")
     messages.append({"role": "user", "content": text})
 
-    # Confirm we understood the question
     play_wav_file_async(config.sfx.after_question_wav, "SFX_AFTER_QUESTION_WAV", config)
 
-    # Get response
     try:
         reply, messages, success = ask_chat_with_tools(messages, config, ha_client, health_monitor)
         messages.append({"role": "assistant", "content": reply})
 
-        # Play success/failure sound
         if success:
             play_wav_file(config.sfx.success_wav, "SFX_SUCCESS_WAV", config)
         else:
@@ -2259,36 +2346,30 @@ def handle_interaction(
         messages.append({"role": "assistant", "content": reply})
         play_wav_file(config.sfx.failure_wav, "SFX_FAILURE_WAV", config)
 
-    # Trim conversation
     messages = trim_conversation(messages, config)
 
     logger.info(f"Assistant: {reply}")
 
-    # Speak response (with barge-in support)
     if reply:
         try:
             speak_tts(reply, config)
         except Exception as e:
             logger.error(f"TTS playback failed: {e}")
 
-    # Enable follow-up mode if configured
-    return messages, config.conversation.followup_enabled
+    return messages, config.conversation.followup_enabled, _last_ambient_threshold
 
 
 def main():
     """Main entry point."""
-    global _porcupine_ref
+    global _porcupine_ref, _last_ambient_threshold
 
-    # Load configuration
     config = load_config()
     mic_device = config.audio.mic_device_index
-    
-    # Initialize OpenAI clients first
+
     initialize_openai_clients()
-    
+
     _print_startup_info(config, mic_device)
 
-    # Initialize components
     porcupine, wake_label = create_porcupine(config)
     _porcupine_ref = porcupine
 
@@ -2297,13 +2378,11 @@ def main():
     ha_client = HomeAssistantClient(config, cache)
     health_monitor = HealthMonitor(config)
     watchdog = Watchdog(config)
-    
-    # Prewarm connections in background for faster first response
+
     prewarm_connections(config, ha_client)
 
     logger.info(f"Assistant running. Wake word mode: {wake_label}")
 
-    # Play startup sound
     play_wav_file(config.sfx.startup_wav, "SFX_STARTUP", config)
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": config.conversation.system_prompt}]
@@ -2314,7 +2393,6 @@ def main():
     logger.info(f"Mic rate: {config.audio.mic_rate} Hz | Porcupine rate: {config.audio.porcupine_rate} Hz")
     logger.info(f"Mic frame: {mic_frame_length} | Porcupine frame: {porc_frame_length}")
 
-    # Start background services
     health_monitor.start()
     watchdog.start()
 
@@ -2329,7 +2407,6 @@ def main():
             while not _shutdown_event.is_set():
                 touch_activity()
 
-                # Wake word detection
                 pcm_bytes = stream.read(mic_frame_length)[0]
                 pcm_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
                 pcm_16k = decimate_to_16k(pcm_i16, config.audio.mic_rate)
@@ -2341,31 +2418,29 @@ def main():
                     logger.info("Wake word detected!")
                     play_wav_file(config.sfx.after_wake_wav, "SFX_AFTER_WAKE_WAV", config)
 
-                    messages, enable_followup = handle_interaction(
+                    messages, enable_followup, ambient_threshold = handle_interaction(
                         stream, mic_frame_length, config, vad, porcupine,
                         messages, ha_client, health_monitor
                     )
 
-                    # Handle follow-up mode (brief listening without wake word)
+                    # PATCH #8: pass calibrated ambient_threshold into follow-up loop
                     while enable_followup and not _shutdown_event.is_set():
                         touch_activity()
                         followup_wav, was_wake_word = record_followup(
-                            stream, mic_frame_length, config.audio.mic_rate, config, vad, porcupine
+                            stream, mic_frame_length, config.audio.mic_rate, config, vad,
+                            porcupine, ambient_threshold
                         )
 
                         if was_wake_word:
-                            # Wake word detected during follow-up - reset conversation
                             logger.info("Wake word detected during follow-up - starting fresh conversation")
                             messages = [{"role": "system", "content": config.conversation.system_prompt}]
                             break
 
                         elif followup_wav is None:
-                            # Timeout or no speech - return to wake word detection
                             logger.debug("Follow-up timeout, returning to wake word detection")
                             break
 
                         else:
-                            # Process follow-up speech
                             play_wav_file_async(config.sfx.processing_wav, "SFX_PROCESSING", config)
 
                             try:
@@ -2407,7 +2482,6 @@ def main():
                                 except Exception as e:
                                     logger.error(f"Follow-up TTS playback failed: {e}")
 
-                            # Check if follow-up should continue
                             enable_followup = config.conversation.followup_enabled
 
     finally:

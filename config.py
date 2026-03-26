@@ -126,6 +126,7 @@ class TTSConfig:
     volume_normalization: bool = True
     target_db: float = -20.0
     direct_streaming: bool = True
+    # PATCH #3: chunk_size kept; stream is now reused across calls (see assistant.py)
     chunk_size: int = 2048
     buffer_chunks: int = 2
 
@@ -142,6 +143,7 @@ class SFXConfig:
     processing_wav: str = ""
     success_wav: str = ""
     failure_wav: str = ""
+    # PATCH #10: listening_wav is now actually played in assistant.py
     listening_wav: str = ""
 
 
@@ -203,8 +205,9 @@ class AssistantConfig:
     health: HealthConfig = field(default_factory=HealthConfig)
     api_max_retries: int = 3
     api_retry_base_delay: float = 1.0
-    debug_tools: bool = True
-    debug_ha: bool = True
+    # PATCH #9: debug flags default to False; enable via .env for development
+    debug_tools: bool = False
+    debug_ha: bool = False
     log_level: str = "INFO"
 
 
@@ -298,8 +301,9 @@ def load_config() -> AssistantConfig:
         ),
         api_max_retries=_env_int("API_MAX_RETRIES", 3),
         api_retry_base_delay=_env_float("API_RETRY_BASE_DELAY", 1.0),
-        debug_tools=_env_bool("DEBUG_TOOLS", True),
-        debug_ha=_env_bool("DEBUG_HA", True),
+        # PATCH #9: default False; set DEBUG_TOOLS=true / DEBUG_HA=true in .env for dev
+        debug_tools=_env_bool("DEBUG_TOOLS", False),
+        debug_ha=_env_bool("DEBUG_HA", False),
         log_level=(_clean_env(os.getenv("LOG_LEVEL")) or "INFO").upper(),
     )
 
