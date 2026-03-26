@@ -1,0 +1,28 @@
+# Core dependencies
+numpy>=1.24.0
+sounddevice>=0.4.6
+pvporcupine>=3.0.0
+requests>=2.31.0
+websocket-client>=1.6.0
+openai>=1.0.0
+python-dotenv>=1.0.0
+
+# Async support
+aiohttp>=3.9.0
+
+# Audio processing (optional but recommended)
+webrtcvad>=2.0.10          # Better voice activity detection
+noisereduce>=3.0.0         # Noise suppression
+
+# Fuzzy matching (optional but recommended)
+rapidfuzz>=3.5.0           # Entity name matching
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+
+# Development
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.5.0
