@@ -90,6 +90,10 @@ def _resolve_path(path: str, base_dir: str) -> str:
 @dataclass
 class AudioConfig:
     """Audio device and processing configuration."""
+    # Devices are matched by NAME at startup (ALSA card numbers shuffle across
+    # reboots when USB devices change); the index/device below are fallbacks.
+    mic_device_name: str = "USB PnP"
+    playback_card_name: str = "UACDemo"
     mic_device_index: int = 2
     alsa_device: str = "default"
     mic_rate: int = 48000
@@ -98,7 +102,7 @@ class AudioConfig:
     vad_frame_ms: int = 30
     max_utterance_seconds: float = 15.0
     silence_rms_threshold: float = 0.015
-    silence_seconds_to_stop: float = 0.35
+    silence_seconds_to_stop: float = 0.9
     min_speech_seconds: float = 0.3
     leading_silence_timeout: float = 2.0
     adaptive_threshold_mult: float = 3.0
@@ -112,9 +116,16 @@ class AudioConfig:
 @dataclass
 class WakeWordConfig:
     """Wake word detection configuration."""
+    # engine: "openwakeword" (local wyoming-openwakeword container, no license)
+    # or "porcupine" (Picovoice cloud-licensed)
+    engine: str = "openwakeword"
     wake_word: str = "picovoice"
     keyword_path: str = ""
     sensitivity: float = 0.65
+    oww_host: str = "127.0.0.1"
+    oww_port: int = 10400
+    oww_model: str = "hey_jarvis"
+    refractory_seconds: float = 2.0
 
 
 @dataclass
@@ -145,6 +156,7 @@ class SFXConfig:
     failure_wav: str = ""
     # PATCH #10: listening_wav is now actually played in assistant.py
     listening_wav: str = ""
+    alarm_wav: str = ""   # chime for alarms/timers (falls back to success_wav)
 
 
 @dataclass
@@ -157,7 +169,8 @@ class HomeAssistantConfig:
     allowed_domains: set = field(default_factory=lambda: {
         "light", "switch", "fan", "cover", "climate", "media_player",
         "scene", "script", "automation", "input_boolean", "button",
-        "select", "number", "lock",
+        "select", "number", "lock", "todo", "music_assistant",
+        "notify",   # desktop / phone notifications
     })
     allowed_services: set = field(default_factory=lambda: {
         "turn_on", "turn_off", "toggle", "open_cover", "close_cover",
@@ -165,20 +178,34 @@ class HomeAssistantConfig:
         "media_pause", "media_stop", "play_media", "volume_set",
         "select_source", "press", "select_option", "set_value",
         "set_percentage", "set_preset_mode", "set_fan_mode", "lock", "unlock",
+        "add_item", "remove_item", "media_next_track", "media_previous_track",
+        "send_message",   # notify entities (desktop/phone)
     })
 
 
 @dataclass
 class ConversationConfig:
     """Conversation and model configuration."""
+    # provider: "auto" uses Claude when ANTHROPIC_API_KEY is set, else OpenAI.
+    # Force with "anthropic" or "openai".
+    provider: str = "auto"
+    anthropic_model: str = "claude-sonnet-5"
     chat_model: str = "gpt-4o"
     transcribe_model: str = "gpt-4o-mini-transcribe"
     max_history_messages: int = 30
     max_tool_rounds: int = 5
     bargein_enabled: bool = True
     followup_enabled: bool = True
-    followup_window_seconds: float = 3.0
-    followup_silence_timeout: float = 0.5
+    followup_window_seconds: float = 6.0   # bounds the wait for speech to START
+    followup_silence_timeout: float = 0.9
+    # Realtime speech-to-speech mode (OpenAI Realtime API). When enabled the
+    # wake word opens a live session instead of the record->STT->LLM->TTS
+    # pipeline; the legacy pipeline remains the automatic fallback.
+    realtime_enabled: bool = False
+    realtime_model: str = "gpt-realtime-2"
+    realtime_voice: str = "ballad"
+    realtime_idle_seconds: float = 25.0    # end session after this much post-reply silence
+    realtime_max_seconds: float = 900.0    # hard session cap (cost guard)
     system_prompt: str = ""
 
 
@@ -194,6 +221,44 @@ class HealthConfig:
 
 
 @dataclass
+class PCControlConfig:
+    """SSH control of Geo's Windows desktop. Disabled unless a host is set.
+    Jarvis can LOCK/SLEEP/media/volume and LAUNCH apps or URLs — actions are
+    built server-side from a fixed template, never raw shell from the LLM."""
+    enabled: bool = False
+    host: str = ""
+    user: str = "geogo"
+    key_path: str = ""            # defaults to ~/.ssh/jarvis_pc
+    ssh_timeout: float = 12.0
+    # app name -> launch target (Start-Process arg). Voice: "open spotify".
+    apps: dict = field(default_factory=lambda: {
+        "spotify": "spotify:",
+        "steam": "steam://open/main",
+        "chrome": "chrome.exe",
+        "edge": "msedge.exe",
+        "explorer": "explorer.exe",
+        "notepad": "notepad.exe",
+        "task manager": "taskmgr.exe",
+        "calculator": "calc.exe",
+    })
+
+
+@dataclass
+class ArtifactConfig:
+    """On-demand generated HTML artifacts (charts, pages, tools) that Claude
+    writes, the Pi serves, and Jarvis opens on Geo's PC screen. Disabled
+    unless Claude is available (needs ANTHROPIC_API_KEY)."""
+    enabled: bool = True
+    model: str = "claude-sonnet-5"
+    # generous: with web search on, thinking + queries share this budget
+    max_tokens: int = 24000
+    # served by HA out of config/www -> http://<pi>:8123/local/artifacts/
+    dir: str = "/home/parzival/homeassistant/config/www/artifacts"
+    url_base: str = "http://192.168.1.171:8123/local/artifacts"
+    open_on_pc: bool = True     # launch each new artifact in the PC browser
+
+
+@dataclass
 class AssistantConfig:
     """Root configuration container."""
     audio: AudioConfig = field(default_factory=AudioConfig)
@@ -203,8 +268,14 @@ class AssistantConfig:
     home_assistant: HomeAssistantConfig = field(default_factory=HomeAssistantConfig)
     conversation: ConversationConfig = field(default_factory=ConversationConfig)
     health: HealthConfig = field(default_factory=HealthConfig)
+    pc_control: PCControlConfig = field(default_factory=PCControlConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
     api_max_retries: int = 3
     api_retry_base_delay: float = 1.0
+    # HUD event stream: SSE server the kiosk HUD connects to for live
+    # state + equalizer levels while Jarvis speaks
+    hud_events_enabled: bool = True
+    hud_events_port: int = 8765
     # PATCH #9: debug flags default to False; enable via .env for development
     debug_tools: bool = False
     debug_ha: bool = False
@@ -235,17 +306,43 @@ def load_config() -> AssistantConfig:
         "  color_temp_kelvin (int), and optionally brightness_pct (0-100).\n"
         "- ALWAYS check current state before actions when relevant - inform user if already in desired state.\n"
         "- Suggest relevant scenes when appropriate based on time of day or context.\n"
+        "- Shopping/todo lists: call ha_call_service with domain='todo', service='add_item',\n"
+        "  data={'entity_id': 'todo.shopping_list', 'item': '<the item>'} (remove_item to remove).\n"
+        "- Timers & reminders: use set_timer (duration_seconds for 'in 10 minutes', at_time 'HH:MM'\n"
+        "  24h for 'at 3pm'; label carries the reminder message). cancel_timer/list_timers manage them.\n"
+        "- MUSIC: to play music call ha_call_service with domain='music_assistant', service='play_media',\n"
+        "  data={'entity_id': '<player>', 'media_id': '<text>', 'media_type': <type>}.\n"
+        "  media_type: 'artist'/'album'/'track'/'playlist' for specific requests;\n"
+        "  use media_type='genre' for genre/vibe/mood requests ('some jazz', 'rock music',\n"
+        "  'chill music') - it resolves to a curated playlist. radio_mode: True only for\n"
+        "  'songs like X' requests with a specific seed artist/track.\n"
+        "  The DEFAULT player (no room named) is media_player.jarvis_speaker (this device's speaker).\n"
+        "  Pause/resume/skip/volume via domain='media_player' (media_pause, media_play,\n"
+        "  media_next_track, volume_set with volume_level 0-1) on the same entity.\n"
+        "- GEO'S WINDOWS PC ('my computer'): use computer_command for lock/sleep/shutdown/\n"
+        "  restart, media (playpause/next/previous), volume (volume_up/volume_down/mute),\n"
+        "  and launch (target = app name or website URL). script.wake_geos_pc turns it ON\n"
+        "  (wake-on-LAN) when it's off. Confirm destructive actions (shutdown/restart) first.\n"
+        "- VISUAL ARTIFACTS: when asked to show/make/draw/visualize something, give a\n"
+        "  TABLE or ranked LIST, or 'put it on my screen' (chart, dashboard, comparison,\n"
+        "  document, or little web tool), use create_artifact with a detailed spec. You\n"
+        "  MAY fill content from your own knowledge (e.g. 'a table of best gear in a game');\n"
+        "  only web_search first when it truly needs live data. It opens an HTML page on\n"
+        "  Geo's monitor and takes a few seconds — tell the user you're composing it BEFORE\n"
+        "  calling the tool. Prefer create_artifact over speaking a long list aloud.\n"
     )
 
     config = AssistantConfig(
         audio=AudioConfig(
+            mic_device_name=_clean_env(os.getenv("MIC_DEVICE_NAME")) or "USB PnP",
+            playback_card_name=_clean_env(os.getenv("PLAYBACK_CARD_NAME")) or "UACDemo",
             mic_device_index=_env_int("MIC_DEVICE_INDEX", 2),
             alsa_device=_clean_env(os.getenv("ALSA_DEVICE")) or "default",
             mic_rate=_env_int("MIC_RATE", 48000),
             vad_mode=_env_int("VAD_MODE", 3),
             max_utterance_seconds=_env_float("MAX_UTTERANCE_SECONDS", 15.0),
             silence_rms_threshold=_env_float("SILENCE_RMS_THRESHOLD", 0.015),
-            silence_seconds_to_stop=_env_float("SILENCE_SECONDS_TO_STOP", 0.35),
+            silence_seconds_to_stop=_env_float("SILENCE_SECONDS_TO_STOP", 0.9),
             min_speech_seconds=_env_float("MIN_SPEECH_SECONDS", 0.3),
             leading_silence_timeout=_env_float("LEADING_SILENCE_TIMEOUT", 2.0),
             adaptive_threshold_mult=_env_float("ADAPTIVE_THRESHOLD_MULT", 3.0),
@@ -253,9 +350,14 @@ def load_config() -> AssistantConfig:
             noise_reduce_enabled=_env_bool("NOISE_REDUCE_ENABLED", False),
         ),
         wake_word=WakeWordConfig(
+            engine=(_clean_env(os.getenv("WAKE_ENGINE")) or "openwakeword").lower(),
             wake_word=_clean_env(os.getenv("WAKE_WORD")) or "picovoice",
             keyword_path=_clean_env(os.getenv("PORCUPINE_KEYWORD_PATH")),
             sensitivity=_env_float("WAKE_SENSITIVITY", 0.65),
+            oww_host=_clean_env(os.getenv("OWW_HOST")) or "127.0.0.1",
+            oww_port=_env_int("OWW_PORT", 10400),
+            oww_model=_clean_env(os.getenv("OWW_MODEL")) or "hey_jarvis",
+            refractory_seconds=_env_float("WAKE_REFRACTORY_SECONDS", 2.0),
         ),
         tts=TTSConfig(
             model=_clean_env(os.getenv("TTS_MODEL")) or "gpt-4o-mini-tts",
@@ -275,6 +377,7 @@ def load_config() -> AssistantConfig:
             success_wav=_resolve_path(_clean_env(os.getenv("SFX_SUCCESS_WAV")), base_dir),
             failure_wav=_resolve_path(_clean_env(os.getenv("SFX_FAILURE_WAV")), base_dir),
             listening_wav=_resolve_path(_clean_env(os.getenv("SFX_LISTENING_WAV")), base_dir),
+            alarm_wav=_resolve_path(_clean_env(os.getenv("SFX_ALARM_WAV")) or "sfx_alarm.wav", base_dir),
         ),
         home_assistant=HomeAssistantConfig(
             url=_clean_env(os.getenv("HOME_ASSISTANT_URL")).rstrip("/"),
@@ -283,14 +386,21 @@ def load_config() -> AssistantConfig:
             areas_cache_ttl_seconds=_env_float("HA_AREAS_CACHE_TTL", 300.0),
         ),
         conversation=ConversationConfig(
+            provider=(_clean_env(os.getenv("CHAT_PROVIDER")) or "auto").lower(),
+            anthropic_model=_clean_env(os.getenv("ANTHROPIC_MODEL")) or "claude-sonnet-5",
             chat_model=_clean_env(os.getenv("CHAT_MODEL")) or "gpt-4o",
             transcribe_model=_clean_env(os.getenv("TRANSCRIBE_MODEL")) or "gpt-4o-mini-transcribe",
             max_history_messages=_env_int("MAX_HISTORY_MESSAGES", 30),
             max_tool_rounds=_env_int("MAX_TOOL_ROUNDS", 5),
             bargein_enabled=_env_bool("BARGEIN_ENABLED", True),
             followup_enabled=_env_bool("FOLLOWUP_ENABLED", True),
-            followup_window_seconds=_env_float("FOLLOWUP_WINDOW_SECONDS", 3.0),
-            followup_silence_timeout=_env_float("FOLLOWUP_SILENCE_TIMEOUT", 0.5),
+            followup_window_seconds=_env_float("FOLLOWUP_WINDOW_SECONDS", 6.0),
+            followup_silence_timeout=_env_float("FOLLOWUP_SILENCE_TIMEOUT", 0.9),
+            realtime_enabled=_env_bool("REALTIME_MODE", False),
+            realtime_model=_clean_env(os.getenv("REALTIME_MODEL")) or "gpt-realtime-2",
+            realtime_voice=_clean_env(os.getenv("REALTIME_VOICE")) or "ballad",
+            realtime_idle_seconds=_env_float("REALTIME_IDLE_SECONDS", 25.0),
+            realtime_max_seconds=_env_float("REALTIME_MAX_SECONDS", 900.0),
             system_prompt=_clean_env(os.getenv("SYSTEM_PROMPT")) or default_system_prompt,
         ),
         health=HealthConfig(
@@ -299,8 +409,28 @@ def load_config() -> AssistantConfig:
             watchdog_enabled=_env_bool("WATCHDOG_ENABLED", True),
             watchdog_timeout_seconds=_env_float("WATCHDOG_TIMEOUT", 120.0),
         ),
+        pc_control=PCControlConfig(
+            enabled=bool(_clean_env(os.getenv("PC_CONTROL_HOST"))),
+            host=_clean_env(os.getenv("PC_CONTROL_HOST")),
+            user=_clean_env(os.getenv("PC_CONTROL_USER")) or "geogo",
+            key_path=(_clean_env(os.getenv("PC_CONTROL_KEY"))
+                      or os.path.expanduser("~/.ssh/jarvis_pc")),
+            ssh_timeout=_env_float("PC_CONTROL_SSH_TIMEOUT", 12.0),
+        ),
+        artifacts=ArtifactConfig(
+            enabled=_env_bool("ARTIFACTS_ENABLED", True),
+            model=_clean_env(os.getenv("ARTIFACT_MODEL")) or "claude-sonnet-5",
+            max_tokens=_env_int("ARTIFACT_MAX_TOKENS", 24000),
+            dir=(_clean_env(os.getenv("ARTIFACT_DIR"))
+                 or "/home/parzival/homeassistant/config/www/artifacts"),
+            url_base=(_clean_env(os.getenv("ARTIFACT_URL_BASE"))
+                      or "http://192.168.1.171:8123/local/artifacts"),
+            open_on_pc=_env_bool("ARTIFACT_OPEN_ON_PC", True),
+        ),
         api_max_retries=_env_int("API_MAX_RETRIES", 3),
         api_retry_base_delay=_env_float("API_RETRY_BASE_DELAY", 1.0),
+        hud_events_enabled=_env_bool("HUD_EVENTS_ENABLED", True),
+        hud_events_port=_env_int("HUD_EVENTS_PORT", 8765),
         # PATCH #9: default False; set DEBUG_TOOLS=true / DEBUG_HA=true in .env for dev
         debug_tools=_env_bool("DEBUG_TOOLS", False),
         debug_ha=_env_bool("DEBUG_HA", False),
