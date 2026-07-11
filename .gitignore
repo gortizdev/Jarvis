@@ -1,1 +1,7 @@
 .env
+
+# personal long-term memory (private facts about the user)
+jarvis_memory.json
+
+# python bytecode cache
+__pycache__/

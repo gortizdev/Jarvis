@@ -181,6 +181,9 @@ def _normalize_text(s: str) -> str:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PLAYBACK_LOCK = threading.Lock()
 _shutdown_event = threading.Event()
+# Set for the full duration of a wake conversation (realtime or legacy) so the
+# proactive announcer stays silent while Geo is talking to Jarvis.
+_conversation_active = threading.Event()
 _wake_detector_ref: Optional[Any] = None
 _playback_interrupt = threading.Event()
 _last_activity_time = time.time()
@@ -213,6 +216,91 @@ def get_thread_pool() -> ThreadPoolExecutor:
         # PATCH #11: raised from 4 to 6 workers to avoid bottleneck with parallel ops
         _thread_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="assistant")
     return _thread_pool
+
+
+# ============================
+# Persistent memory
+# ============================
+# Long-term facts Jarvis keeps ACROSS conversations (preferences, names,
+# recurring plans). Stored as a small JSON list beside this file; injected
+# into every session's system prompt so the model always knows them, and
+# mutated by the remember/forget tools. Kept deliberately small (a briefing
+# fact sheet, not a database) — capped so the prompt stays lean.
+MEMORY_PATH = os.path.join(BASE_DIR, "jarvis_memory.json")
+_MEMORY_MAX = 40                # oldest dropped past this
+_memory_lock = threading.Lock()
+
+
+def _load_memories() -> List[Dict[str, Any]]:
+    try:
+        with open(MEMORY_PATH) as f:
+            data = json.load(f)
+        items = data.get("memories", []) if isinstance(data, dict) else data
+        return [m for m in items if isinstance(m, dict) and m.get("text")]
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_memories(items: List[Dict[str, Any]]) -> None:
+    tmp = MEMORY_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"memories": items[-_MEMORY_MAX:]}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, MEMORY_PATH)          # atomic: never a half-written file
+    except OSError as e:
+        logger.warning(f"Memory save failed: {e}")
+
+
+def add_memory(text: str) -> Dict[str, Any]:
+    """Store one durable fact. De-dupes near-identical text."""
+    text = " ".join((text or "").split())[:240]
+    if not text:
+        return {"error": "nothing to remember"}
+    with _memory_lock:
+        items = _load_memories()
+        norm = _normalize_text(text)
+        for m in items:
+            if _normalize_text(m["text"]) == norm:
+                return {"status": "already remembered", "text": m["text"]}
+        items.append({"text": text, "ts": datetime.now().strftime("%Y-%m-%d")})
+        _save_memories(items)
+        logger.info(f"Memory added: {text!r} ({len(items)} total)")
+        return {"status": "remembered", "text": text, "total": len(items)}
+
+
+def forget_memory(query: str) -> Dict[str, Any]:
+    """Remove memories matching `query` (word overlap / substring). Empty
+    query is refused so 'forget it' can't wipe everything by accident."""
+    q = _normalize_text(query)
+    if not q:
+        return {"error": "say what to forget (e.g. 'forget my coffee order')"}
+    with _memory_lock:
+        items = _load_memories()
+        qwords = set(q.split())
+        kept, removed = [], []
+        for m in items:
+            mn = _normalize_text(m["text"])
+            hit = q in mn or mn in q or (qwords & set(mn.split()) and
+                  len(qwords & set(mn.split())) >= max(1, len(qwords) // 2))
+            (removed if hit else kept).append(m)
+        if not removed:
+            return {"error": f"nothing matches '{query}'",
+                    "current_memories": [m["text"] for m in items]}
+        _save_memories(kept)
+        logger.info(f"Memory forgot {len(removed)}: {[m['text'] for m in removed]}")
+        return {"status": "forgotten", "removed": [m["text"] for m in removed],
+                "remaining": len(kept)}
+
+
+def _memory_prompt_block() -> str:
+    """Rendered into the system prompt each session so the model always has
+    the facts. Empty string when there are none (adds nothing to the prompt)."""
+    items = _load_memories()
+    if not items:
+        return ""
+    lines = "\n".join(f"- {m['text']}" for m in items)
+    return ("\n\nWHAT YOU KNOW ABOUT GEO (persistent memory; use naturally, "
+            "don't recite unless asked):\n" + lines)
 
 
 # ============================
@@ -2567,6 +2655,63 @@ def _tools_schema():
         {
             "type": "function",
             "function": {
+                "name": "daily_briefing",
+                "description": (
+                    "Give Geo a spoken briefing of his day: date, weather, "
+                    "today's World Cup and Formula 1, and open tasks. Use for "
+                    "'good morning', 'brief me', 'what's my day look like', "
+                    "'what's going on today'. Read the returned 'spoken' text "
+                    "aloud naturally."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remember",
+                "description": (
+                    "Save a durable fact about Geo or his preferences to "
+                    "long-term memory that persists across ALL future "
+                    "conversations. Use when he says 'remember...', states a "
+                    "lasting preference ('I take my coffee black', 'call me "
+                    "boss'), or shares info clearly worth keeping (birthdays, "
+                    "his teams, routines). Do NOT use for one-off task details "
+                    "or timers. Confirm briefly after saving."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description":
+                                 "the fact, phrased to stand alone later, e.g. "
+                                 "'Geo supports Argentina in the World Cup'"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "forget",
+                "description": (
+                    "Remove something from long-term memory when Geo says "
+                    "'forget...' or corrects a fact you stored. Matches by "
+                    "description."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description":
+                                  "words identifying the memory, e.g. 'coffee'"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "open_artifact",
                 "description": (
                     "Re-open a PREVIOUSLY created artifact in its themed window "
@@ -3252,6 +3397,262 @@ def open_artifact(config: AssistantConfig, query: str = "") -> Dict[str, Any]:
             "url": view_url, "opened_on_pc": opened}
 
 
+# ============================
+# Daily briefing
+# ============================
+def _espn_json(url: str, timeout: float = 6.0) -> Optional[dict]:
+    """Fetch an ESPN public JSON endpoint server-side (the dash does this in
+    the browser). Returns None on any failure — the briefing degrades."""
+    try:
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": "jarvis/1.0"})
+        return r.json() if r.ok else None
+    except Exception:
+        return None
+
+
+def _f1_race_label(name: str) -> str:
+    """ESPN F1 event names carry a sponsor prefix ('Moët & Chandon Belgian
+    Grand Prix'). Keep the nationality + 'Grand Prix' — the nationality is the
+    word right before 'Grand Prix'/'GP' (rare multi-word countries lose the
+    leading word but stay intelligible when spoken)."""
+    m = re.search(r"([A-Za-z']+)\s+(?:Grand Prix|GP)\b", name or "", re.I)
+    return f"{m.group(1)} Grand Prix" if m else (name or "the race")
+
+
+def _briefing_sports() -> List[str]:
+    """Today's World Cup fixtures + the next F1 GP if it's today/tomorrow.
+    Each returned string is one spoken line."""
+    lines: List[str] = []
+    today = datetime.now().strftime("%Y%m%d")
+    wc = _espn_json("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+                    f"fifa.world/scoreboard?dates={today}")
+    for ev in (wc or {}).get("events", [])[:4]:
+        try:
+            comp = ev["competitions"][0]
+            teams = comp["competitors"]
+            home = next(t for t in teams if t["homeAway"] == "home")
+            away = next(t for t in teams if t["homeAway"] == "away")
+            hn = home["team"].get("shortDisplayName") or home["team"]["displayName"]
+            an = away["team"].get("shortDisplayName") or away["team"]["displayName"]
+            st = ev["status"]["type"]["state"]
+            if st == "pre":
+                t = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone()
+                lines.append(f"World Cup: {hn} versus {an} at "
+                             f"{t.strftime('%-I:%M %p').lstrip('0')}.")
+            elif st == "in":
+                lines.append(f"World Cup LIVE now: {hn} {home.get('score','')}, "
+                             f"{an} {away.get('score','')}.")
+            else:
+                lines.append(f"World Cup final: {hn} {home.get('score','')}, "
+                             f"{an} {away.get('score','')}.")
+        except (KeyError, StopIteration, ValueError):
+            continue
+    f1 = _espn_json("https://site.api.espn.com/apis/site/v2/sports/racing/"
+                    "f1/scoreboard")
+    for ev in (f1 or {}).get("events", [])[:1]:
+        try:
+            t = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone()
+            days = (t.date() - datetime.now().date()).days
+            when = {0: "today", 1: "tomorrow"}.get(days)
+            if when:
+                name = _f1_race_label(ev.get("name", ""))
+                lines.append(f"Formula 1: the {name} is {when} at "
+                             f"{t.strftime('%-I:%M %p').lstrip('0')}.")
+        except (KeyError, ValueError):
+            continue
+    return lines
+
+
+def _ha_today_forecast(config: AssistantConfig, ha_client) -> Optional[dict]:
+    """Today's forecast row via weather.get_forecasts (return_response).
+    Internal — bypasses the LLM service allowlist deliberately."""
+    try:
+        url = (f"{config.home_assistant.url}/api/services/weather/get_forecasts"
+               "?return_response=true")
+        session = get_http_session(config)
+        r = session.post(url, headers=ha_client._headers(),
+                         json={"type": "daily",
+                               "entity_id": "weather.forecast_home"}, timeout=8)
+        if not r.ok:
+            return None
+        sr = r.json().get("service_response", {})
+        fc = sr.get("weather.forecast_home", {}).get("forecast", [])
+        return fc[0] if fc else None
+    except Exception:
+        return None
+
+
+def daily_briefing(config: AssistantConfig, ha_client) -> Dict[str, Any]:
+    """Assemble a short spoken morning briefing: greeting, weather, today's
+    sport, and open task count. Every section degrades independently so a
+    dead data source never sinks the whole briefing."""
+    now = datetime.now()
+    hour = now.hour
+    greeting = ("Good morning" if hour < 12 else
+                "Good afternoon" if hour < 18 else "Good evening")
+    parts: List[str] = [f"{greeting}, sir. It's {now.strftime('%A, %B %-d')}."]
+
+    # weather (current from entity state + today's high/low from forecast)
+    try:
+        w = ha_client.get_state("weather.forecast_home")
+        cond = (w.get("state") or "").replace("-", " ")
+        temp = w.get("attributes", {}).get("temperature")
+        unit = w.get("attributes", {}).get("temperature_unit", "°")
+        wline = f"Right now it's {round(temp)}{unit} and {cond}" if temp is not None \
+            else f"Currently {cond}"
+        fc = _ha_today_forecast(config, ha_client)
+        if fc:
+            hi, lo = fc.get("temperature"), fc.get("templow")
+            fcond = (fc.get("condition") or "").replace("-", " ")
+            if hi is not None and lo is not None:
+                wline += (f", with a high of {round(hi)} and a low of {round(lo)}"
+                          f"{'; ' + fcond + ' expected' if fcond and fcond != cond else ''}")
+        parts.append(wline + ".")
+    except Exception as e:
+        logger.debug(f"Briefing weather failed: {e}")
+
+    # sport
+    try:
+        sport = _briefing_sports()
+        parts.extend(sport if sport else ["No World Cup or Formula 1 on the calendar today."])
+    except Exception as e:
+        logger.debug(f"Briefing sports failed: {e}")
+
+    # tasks
+    try:
+        todo = ha_client.get_state("todo.shopping_list")
+        n = int(todo.get("state") or 0)
+        if n:
+            parts.append(f"You have {n} item{'s' if n != 1 else ''} on your shopping list.")
+    except Exception:
+        pass
+
+    text = " ".join(parts)
+    logger.info(f"Briefing assembled ({len(parts)} parts)")
+    return {"status": "briefing", "spoken": text,
+            "note": "Read this aloud naturally as a single briefing."}
+
+
+# ============================
+# Proactive sports announcer
+# ============================
+class SportsAnnouncer:
+    """Background thread that watches live World Cup matches and the next F1
+    session and speaks up when something happens — a goal, kickoff, or a race
+    about to start. Speaks ONLY when Jarvis is idle (no active conversation,
+    nothing else playing); a chat always wins. Opt out with SPORTS_ANNOUNCE=0."""
+
+    def __init__(self, config: AssistantConfig):
+        self.config = config
+        self.enabled = os.getenv("SPORTS_ANNOUNCE", "1") != "0"
+        self._thread: Optional[threading.Thread] = None
+        self._scores: Dict[str, tuple] = {}     # match id -> (home, away) score
+        self._live_seen: set = set()            # matches we've announced kickoff for
+        self._f1_warned: set = set()            # event ids we've warned about
+        self._primed = False                    # first poll seeds state silently
+
+    def start(self):
+        if not self.enabled:
+            logger.info("Sports announcer disabled (SPORTS_ANNOUNCE=0)")
+            return
+        self._thread = threading.Thread(target=self._loop, name="sports-announce",
+                                        daemon=True)
+        self._thread.start()
+        logger.info("Sports announcer started")
+
+    def _say(self, text: str) -> bool:
+        """Speak only if truly idle. Returns False if it had to defer."""
+        if _conversation_active.is_set() or _shutdown_event.is_set():
+            return False
+        if echo_cancellation.should_suppress():
+            return False
+        # non-blocking: never hold up polling on a stuck speaker
+        if not PLAYBACK_LOCK.acquire(blocking=False):
+            return False
+        try:
+            hud.set_state("speaking")
+            logger.info(f"Announce: {text}")
+            speak_tts_realtime(text, self.config)
+            return True
+        except Exception as e:
+            logger.warning(f"Announce failed: {e}")
+            return False
+        finally:
+            PLAYBACK_LOCK.release()
+            hud.set_state("idle")
+
+    def _poll_once(self):
+        today = datetime.now().strftime("%Y%m%d")
+        wc = _espn_json("https://site.api.espn.com/apis/site/v2/sports/soccer/"
+                        f"fifa.world/scoreboard?dates={today}")
+        events = (wc or {}).get("events", [])
+        announcements: List[str] = []
+        for ev in events:
+            try:
+                eid = ev["id"]
+                comp = ev["competitions"][0]
+                teams = comp["competitors"]
+                home = next(t for t in teams if t["homeAway"] == "home")
+                away = next(t for t in teams if t["homeAway"] == "away")
+                hn = home["team"].get("shortDisplayName") or home["team"]["displayName"]
+                an = away["team"].get("shortDisplayName") or away["team"]["displayName"]
+                st = ev["status"]["type"]["state"]
+                hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+            except (KeyError, StopIteration, ValueError):
+                continue
+            if st == "in":
+                if eid not in self._live_seen:
+                    self._live_seen.add(eid)
+                    if self._primed:
+                        announcements.append(f"Sir, {hn} versus {an} has kicked off.")
+                prev = self._scores.get(eid)
+                if prev is not None and (hs, as_) != prev and self._primed:
+                    scorer = hn if hs > prev[0] else an
+                    announcements.append(f"Goal! {scorer} scores. {hn} {hs}, {an} {as_}.")
+                self._scores[eid] = (hs, as_)
+            elif st == "post" and eid in self._scores and self._primed:
+                announcements.append(f"Full time: {hn} {hs}, {an} {as_}.")
+                self._scores.pop(eid, None)
+                self._live_seen.discard(eid)
+
+        # F1: warn ~15 min before a session that starts today
+        f1 = _espn_json("https://site.api.espn.com/apis/site/v2/sports/racing/"
+                        "f1/scoreboard")
+        for ev in (f1 or {}).get("events", [])[:1]:
+            try:
+                eid = ev["id"]
+                t = datetime.fromisoformat(ev["date"].replace("Z", "+00:00")).astimezone()
+                mins = (t - datetime.now(t.tzinfo)).total_seconds() / 60
+                if 0 < mins <= 15 and eid not in self._f1_warned and self._primed:
+                    self._f1_warned.add(eid)
+                    name = _f1_race_label(ev.get("name", ""))
+                    announcements.append(f"Sir, the {name} starts in about "
+                                         f"{int(round(mins))} minutes.")
+            except (KeyError, ValueError):
+                continue
+
+        self._primed = True
+        for a in announcements:
+            if not self._say(a):
+                break            # busy — drop the rest, they'll re-derive next poll
+            time.sleep(0.5)
+
+    def _loop(self):
+        # small stagger so startup logs settle first
+        _shutdown_event.wait(20)
+        while not _shutdown_event.is_set():
+            try:
+                self._poll_once()
+            except Exception as e:
+                logger.debug(f"Sports announcer poll error: {e}")
+            _shutdown_event.wait(self._interval())
+
+    def _interval(self) -> float:
+        # poll fast (60s) when a match is live, lazily (5 min) otherwise
+        return 60.0 if self._scores else 300.0
+
+
 def _write_artifact_gallery(art_dir: str):
     """Regenerate a simple index of all artifacts (newest first)."""
     try:
@@ -3462,6 +3863,18 @@ def _execute_tool(
 
         elif fn == "view_screen":
             result = pc_view_screen(config, str(parsed.get("screen", "all")))
+            return result, "error" not in result
+
+        elif fn == "daily_briefing":
+            result = daily_briefing(config, ha_client)
+            return result, "error" not in result
+
+        elif fn == "remember":
+            result = add_memory(str(parsed.get("text", "")))
+            return result, "error" not in result
+
+        elif fn == "forget":
+            result = forget_memory(str(parsed.get("query", "")))
             return result, "error" not in result
 
         elif fn == "open_artifact":
@@ -3775,6 +4188,54 @@ def _anthropic_tools_schema():
                                        "visual content — false builds faster"},
                 },
                 "required": ["spec"],
+            },
+        },
+        {
+            "name": "daily_briefing",
+            "description": (
+                "Give Geo a spoken briefing of his day: date, weather, "
+                "today's World Cup and Formula 1, and open tasks. Use for "
+                "'good morning', 'brief me', 'what's my day look like', "
+                "'what's going on today'. Read the returned 'spoken' text "
+                "aloud naturally."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "remember",
+            "description": (
+                "Save a durable fact about Geo or his preferences to "
+                "long-term memory that persists across ALL future "
+                "conversations. Use when he says 'remember...', states a "
+                "lasting preference ('I take my coffee black', 'call me "
+                "boss'), or shares info clearly worth keeping (birthdays, "
+                "his teams, routines). Do NOT use for one-off task details "
+                "or timers. Confirm briefly after saving."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description":
+                             "the fact, phrased to stand alone later, e.g. "
+                             "'Geo supports Argentina in the World Cup'"},
+                },
+                "required": ["text"],
+            },
+        },
+        {
+            "name": "forget",
+            "description": (
+                "Remove something from long-term memory when Geo says "
+                "'forget...' or corrects a fact you stored. Matches by "
+                "description."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description":
+                              "words identifying the memory, e.g. 'coffee'"},
+                },
+                "required": ["query"],
             },
         },
         {
@@ -4158,7 +4619,9 @@ def run_realtime_conversation(stream, mic_frame_length: int,
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "instructions": config.conversation.system_prompt + REALTIME_INSTRUCTIONS_ADDENDUM,
+            "instructions": (config.conversation.system_prompt
+                             + REALTIME_INSTRUCTIONS_ADDENDUM
+                             + _memory_prompt_block()),
             # end_conversation is realtime-only: handled by the receiver loop
             # below, never routed to _execute_tool
             "tools": _realtime_tools_schema() + [{
@@ -5522,7 +5985,8 @@ def main():
 
     play_wav_file(config.sfx.startup_wav, "SFX_STARTUP", config)
 
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": config.conversation.system_prompt}]
+    messages: List[Dict[str, Any]] = [{"role": "system",
+        "content": config.conversation.system_prompt + _memory_prompt_block()}]
 
     wake_frame_length = wake_detector.frame_length
     mic_frame_length = int(wake_frame_length * config.audio.mic_rate / config.audio.porcupine_rate)
@@ -5532,6 +5996,8 @@ def main():
 
     health_monitor.start()
     watchdog.start()
+    sports_announcer = SportsAnnouncer(config)
+    sports_announcer.start()
 
     try:
         with sd.RawInputStream(
@@ -5554,6 +6020,7 @@ def main():
                 if wake_detector.process(pcm_16k[:wake_frame_length]):
                     logger.info("Wake word detected!")
                     hud.set_state("listening")  # pop the HUD equalizer immediately
+                    _conversation_active.set()  # mute the sports announcer
                     # async: "Yes sir" overlaps the ~2s realtime connect instead
                     # of preceding it — the echo gate keeps it out of the mic
                     play_wav_file_async(config.sfx.after_wake_wav,
@@ -5562,6 +6029,7 @@ def main():
                     if config.conversation.realtime_enabled and \
                             run_realtime_conversation(stream, mic_frame_length,
                                                       config, ha_client):
+                        _conversation_active.clear()
                         wake_detector.reset()
                         hud.set_state("idle")
                         continue
@@ -5583,7 +6051,8 @@ def main():
 
                         if was_wake_word:
                             logger.info("Wake word detected during follow-up - starting fresh conversation")
-                            messages = [{"role": "system", "content": config.conversation.system_prompt}]
+                            messages = [{"role": "system",
+                                "content": config.conversation.system_prompt + _memory_prompt_block()}]
                             break
 
                         elif followup_wav is None:
@@ -5630,6 +6099,7 @@ def main():
 
                     # Flush stale buffered audio/detections before resuming
                     # wake listening (matters for the wyoming stream)
+                    _conversation_active.clear()
                     wake_detector.reset()
                     hud.set_state("idle")
 
