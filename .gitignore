@@ -5,3 +5,6 @@ jarvis_memory.json
 
 # python bytecode cache
 __pycache__/
+
+# personal weight log (private)
+weight_log.json

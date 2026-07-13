@@ -68,6 +68,8 @@ from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 import queue
 
+import fitness_plan as fp   # Geo's Summer Reset plan data + schedule helpers
+
 # Wake word engines — openWakeWord (via wyoming-openwakeword container) is the
 # default; Porcupine is optional and only needed when WAKE_ENGINE=porcupine.
 try:
@@ -421,7 +423,8 @@ class HudBroadcaster:
                     # renders current state without waiting for a mutation
                     for kind, items in (("timers", timers.snapshot()),
                                         ("alarms", alarms.snapshot()),
-                                        ("alarmvol", alarms.volume)):
+                                        ("alarmvol", alarms.volume),
+                                        ("weight", weight_stats())):
                         self.wfile.write(
                             f"data: {json.dumps({'t': kind, 'v': items})}\n\n".encode()
                         )
@@ -785,11 +788,45 @@ class AlarmManager:
             raise ValueError(at_time)
         return hh, mm
 
+    # python weekday(): Mon=0 .. Sun=6
+    _DAY_IDX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+    @classmethod
+    def _repeat_days(cls, repeat: str) -> Optional[set]:
+        """Allowed weekdays for a repeat, or None = every day (once/daily).
+        Accepts 'daily', 'weekdays', 'weekends', or a comma/space list of day
+        abbreviations ('sun,mon,tue,wed,thu'). Returns None for unrecognized
+        so callers can validate."""
+        repeat = (repeat or "").strip().lower()
+        if repeat in ("", "daily"):
+            return None
+        if repeat == "weekdays":
+            return {0, 1, 2, 3, 4}
+        if repeat == "weekends":
+            return {5, 6}
+        days = {cls._DAY_IDX[t[:3]] for t in re.split(r"[,\s]+", repeat)
+                if t[:3] in cls._DAY_IDX}
+        return days or None
+
+    @classmethod
+    def _normalize_repeat(cls, repeat: str) -> Optional[str]:
+        """Canonical repeat string, or None if invalid. A day-set canonicalizes
+        to Mon..Sun-ordered abbreviations ('mon,tue,wed,thu,sun')."""
+        repeat = (repeat or "").strip().lower()
+        if repeat in ("", "daily", "weekdays", "weekends"):
+            return repeat
+        days = cls._repeat_days(repeat)
+        if not days:
+            return None
+        inv = {v: k for k, v in cls._DAY_IDX.items()}
+        return ",".join(inv[i] for i in sorted(days))
+
     def _next_fire(self, at_time: str, repeat: str) -> float:
         hh, mm = self._parse_hhmm(at_time)
+        days = self._repeat_days(repeat)
         now = datetime.now()
         target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        while target <= now or (repeat == "weekdays" and target.weekday() >= 5):
+        while target <= now or (days is not None and target.weekday() not in days):
             target += timedelta(days=1)
         return target.timestamp()
 
@@ -828,9 +865,11 @@ class AlarmManager:
                   repeat: str = "") -> Dict[str, Any]:
         if not self._loaded:
             return {"error": "alarms still loading, try again"}
-        repeat = (repeat or "").strip().lower()
-        if repeat not in ("", "daily", "weekdays"):
-            return {"error": f"repeat must be '', 'daily' or 'weekdays', got '{repeat}'"}
+        canon = self._normalize_repeat(repeat)
+        if canon is None:
+            return {"error": f"repeat must be '', 'daily', 'weekdays', 'weekends', "
+                             f"or a day list like 'sun,mon,tue,wed,thu', got '{repeat}'"}
+        repeat = canon
         try:
             fire = self._next_fire(at_time, repeat)
             hh, mm = self._parse_hhmm(at_time)
@@ -2669,6 +2708,60 @@ def _tools_schema():
         {
             "type": "function",
             "function": {
+                "name": "log_weight",
+                "description": (
+                    "Record Geo's morning weigh-in for his Summer Reset plan. "
+                    "Use when he says 'log my weight ...', 'I weigh ...', "
+                    "'weigh-in one seventy-nine ...'. Returns the fresh 7-day "
+                    "average and week trend to read back."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "lbs": {"type": "number", "description": "weight in pounds"},
+                    },
+                    "required": ["lbs"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "workout",
+                "description": (
+                    "Geo's training for today (or a named weekday) from his "
+                    "Summer Reset split. Use for 'what's my workout', 'what am I "
+                    "training today', 'show me the workout'. Set show=true to put "
+                    "the full routine on his PC screen; otherwise it returns a "
+                    "spoken summary."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "day": {"type": "string", "description":
+                                "weekday like 'monday' or 'thu'; omit for today"},
+                        "show": {"type": "boolean", "description":
+                                 "true = display the full routine on screen"},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fitness_progress",
+                "description": (
+                    "Show Geo's weight-loss progress dashboard on his PC screen: "
+                    "weight trend, day of the plan, projected goal date, and macro "
+                    "targets. Use for 'how's my progress', 'show my weight "
+                    "progress', 'am I on track'."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "remember",
                 "description": (
                     "Save a durable fact about Geo or his preferences to "
@@ -2738,7 +2831,9 @@ def _tools_schema():
                 "description": (
                     "Set a wake-up style alarm for a wall-clock time (persists across "
                     "restarts; announces repeatedly until dismissed). at_time is 24h "
-                    "'HH:MM'. repeat may be 'daily' or 'weekdays'. Setting an alarm "
+                    "'HH:MM'. repeat may be 'daily', 'weekdays' (Mon-Fri), "
+                    "'weekends', or a specific day list like 'sun,mon,tue,wed,thu'. "
+                    "Setting an alarm "
                     "with the same time and label REPLACES it (use that to edit). "
                     "Use set_timer for countdowns instead."
                 ),
@@ -2747,7 +2842,9 @@ def _tools_schema():
                     "properties": {
                         "at_time": {"type": "string", "description": "24h HH:MM"},
                         "label": {"type": "string"},
-                        "repeat": {"type": "string", "enum": ["", "daily", "weekdays"]},
+                        "repeat": {"type": "string", "description":
+                                   "'', 'daily', 'weekdays', 'weekends', or a "
+                                   "day list e.g. 'sun,mon,tue,wed,thu'"},
                     },
                     "required": ["at_time"],
                 },
@@ -3306,27 +3403,34 @@ def create_artifact(config: AssistantConfig, spec: str, title: str = "",
         return {"error": "model did not return HTML"}
 
     try:
-        os.makedirs(art.dir, exist_ok=True)
-        stamp = datetime.now().strftime("%m%d-%H%M%S")
-        fname = f"{_slugify(title or spec)}-{stamp}.html"
-        with open(os.path.join(art.dir, fname), "w", encoding="utf-8") as f:
-            f.write(html)
-        _write_artifact_gallery(art.dir)
+        view_url, opened = _save_and_open_artifact(config, html, title or spec)
     except Exception as e:
         logger.error(f"Artifact save failed: {e}")
         return {"error": f"could not save artifact: {e}"}
-
-    url = f"{art.url_base}/{fname}"
-    # themed shell: viewer.html wraps the artifact in a Jarvis HUD frame and
-    # Edge --app mode gives it its own chromeless window (no tabs/URL bar)
-    from urllib.parse import quote
-    view_url = (f"{art.url_base}/viewer.html?v={_VIEWER_VER}&src={fname}"
-                f"&title={quote((title or _artifact_label(fname))[:80])}")
-    logger.info(f"Artifact created: {url} ({len(html)} bytes)")
-    opened = art.open_on_pc and _pc_open_viewer(config, view_url)
     return {"status": "created", "title": title or "artifact",
             "url": view_url, "opened_on_pc": opened,
             "gallery": f"{config.artifacts.url_base}/index.html"}
+
+
+def _save_and_open_artifact(config: AssistantConfig, html: str,
+                            title: str) -> Tuple[str, bool]:
+    """Persist an artifact HTML doc, refresh the gallery, and open it in the
+    themed borderless window. Shared by create_artifact (LLM-written) and the
+    deterministic builders (workout, fitness progress). Returns (view_url,
+    opened_on_pc)."""
+    from urllib.parse import quote
+    art = config.artifacts
+    os.makedirs(art.dir, exist_ok=True)
+    stamp = datetime.now().strftime("%m%d-%H%M%S")
+    fname = f"{_slugify(title)}-{stamp}.html"
+    with open(os.path.join(art.dir, fname), "w", encoding="utf-8") as f:
+        f.write(html)
+    _write_artifact_gallery(art.dir)
+    view_url = (f"{art.url_base}/viewer.html?v={_VIEWER_VER}&src={fname}"
+                f"&title={quote((title or _artifact_label(fname))[:80])}")
+    logger.info(f"Artifact saved: {fname} ({len(html)} bytes)")
+    opened = art.open_on_pc and _pc_open_viewer(config, view_url)
+    return view_url, opened
 
 
 def _pc_open_viewer(config: AssistantConfig, view_url: str) -> bool:
@@ -3464,6 +3568,18 @@ def _briefing_sports() -> List[str]:
     return lines
 
 
+_WEATHER_WORDS = {
+    "partlycloudy": "partly cloudy", "clear-night": "clear", "snowy-rainy": "sleet",
+    "lightning-rainy": "thunderstorms", "windy-variant": "windy",
+    "pouring": "pouring rain", "exceptional": "severe weather",
+}
+
+
+def _pretty_condition(state: Optional[str]) -> str:
+    s = (state or "").strip().lower()
+    return _WEATHER_WORDS.get(s, s.replace("-", " "))
+
+
 def _ha_today_forecast(config: AssistantConfig, ha_client) -> Optional[dict]:
     """Today's forecast row via weather.get_forecasts (return_response).
     Internal — bypasses the LLM service allowlist deliberately."""
@@ -3496,7 +3612,7 @@ def daily_briefing(config: AssistantConfig, ha_client) -> Dict[str, Any]:
     # weather (current from entity state + today's high/low from forecast)
     try:
         w = ha_client.get_state("weather.forecast_home")
-        cond = (w.get("state") or "").replace("-", " ")
+        cond = _pretty_condition(w.get("state"))
         temp = w.get("attributes", {}).get("temperature")
         unit = w.get("attributes", {}).get("temperature_unit", "°")
         wline = f"Right now it's {round(temp)}{unit} and {cond}" if temp is not None \
@@ -3504,13 +3620,19 @@ def daily_briefing(config: AssistantConfig, ha_client) -> Dict[str, Any]:
         fc = _ha_today_forecast(config, ha_client)
         if fc:
             hi, lo = fc.get("temperature"), fc.get("templow")
-            fcond = (fc.get("condition") or "").replace("-", " ")
+            fcond = _pretty_condition(fc.get("condition"))
             if hi is not None and lo is not None:
                 wline += (f", with a high of {round(hi)} and a low of {round(lo)}"
                           f"{'; ' + fcond + ' expected' if fcond and fcond != cond else ''}")
         parts.append(wline + ".")
     except Exception as e:
         logger.debug(f"Briefing weather failed: {e}")
+
+    # fitness plan: only once the reset has started
+    try:
+        parts.extend(_briefing_fitness())
+    except Exception as e:
+        logger.debug(f"Briefing fitness failed: {e}")
 
     # sport
     try:
@@ -3532,6 +3654,280 @@ def daily_briefing(config: AssistantConfig, ha_client) -> Dict[str, Any]:
     logger.info(f"Briefing assembled ({len(parts)} parts)")
     return {"status": "briefing", "spoken": text,
             "note": "Read this aloud naturally as a single briefing."}
+
+
+# ============================
+# Fitness: Summer Reset plan features
+# ============================
+WEIGHT_PATH = os.path.join(BASE_DIR, "weight_log.json")
+_weight_lock = threading.Lock()
+
+
+def _load_weights() -> List[Dict[str, Any]]:
+    try:
+        with open(WEIGHT_PATH) as f:
+            data = json.load(f)
+        items = data.get("entries", []) if isinstance(data, dict) else data
+        return [e for e in items if isinstance(e, dict) and "lbs" in e and "date" in e]
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def _save_weights(items: List[Dict[str, Any]]) -> None:
+    tmp = WEIGHT_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"entries": items}, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, WEIGHT_PATH)
+    except OSError as e:
+        logger.warning(f"Weight save failed: {e}")
+
+
+def weight_stats() -> Dict[str, Any]:
+    """Latest weight, 7-day rolling average (the number the plan says to judge
+    by), change vs. the previous 7-day window, and progress toward goal."""
+    items = sorted(_load_weights(), key=lambda e: e["date"])
+    if not items:
+        return {"count": 0}
+    latest = items[-1]
+    last7 = [e["lbs"] for e in items[-7:]]
+    avg7 = round(sum(last7) / len(last7), 1)
+    prev7 = [e["lbs"] for e in items[-14:-7]]
+    trend = None
+    if prev7:
+        trend = round(avg7 - sum(prev7) / len(prev7), 1)   # neg = losing
+    to_goal = round(latest["lbs"] - fp.GOAL_WEIGHT, 1)
+    lost = round(fp.START_WEIGHT - latest["lbs"], 1)
+    return {"count": len(items), "latest": latest["lbs"], "latest_date": latest["date"],
+            "avg7": avg7, "week_change": trend, "to_goal": to_goal, "lost": lost}
+
+
+def log_weight(lbs: Any) -> Dict[str, Any]:
+    """Record a morning weigh-in. One entry per day (a second logging replaces
+    the day's value). Returns the fresh 7-day average and trend to speak back."""
+    try:
+        val = round(float(lbs), 1)
+    except (TypeError, ValueError):
+        return {"error": f"'{lbs}' isn't a number I can log"}
+    if not (50 <= val <= 600):
+        return {"error": f"{val} lbs is outside a believable range"}
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _weight_lock:
+        items = [e for e in _load_weights() if e.get("date") != today]
+        items.append({"date": today, "lbs": val})
+        items.sort(key=lambda e: e["date"])
+        _save_weights(items)
+    st = weight_stats()
+    logger.info(f"Weight logged: {val} lbs (7-day avg {st.get('avg7')})")
+    try:
+        hud._broadcast({"t": "weight", "v": st})   # live-update the dash tile
+    except Exception:
+        pass
+    spoken = f"Logged {val} pounds."
+    if st.get("week_change") is not None:
+        direction = ("down" if st["week_change"] < 0 else
+                     "up" if st["week_change"] > 0 else "flat")
+        spoken += (f" Your 7-day average is {st['avg7']}, "
+                   f"{direction} {abs(st['week_change'])} from last week.")
+    elif st.get("count", 0) >= 2:
+        spoken += f" Your average so far is {st['avg7']} pounds."
+    else:
+        spoken += " That's your first entry — I'll start tracking the trend."
+    if st.get("to_goal") is not None and st["to_goal"] <= 0:
+        spoken += " You've hit your goal weight — outstanding, sir."
+    return {"status": "logged", "spoken": spoken, **st}
+
+
+def _briefing_fitness() -> List[str]:
+    """The training/plan lines for the morning briefing (empty before reset)."""
+    today = datetime.now().date()
+    day_n = fp.plan_day_number(today)
+    if day_n < 1:
+        days_to = (fp.RESET_DATE - today).days
+        if days_to == 1:
+            return ["Your Summer Reset starts tomorrow — first session is Back day."]
+        return []
+    lines: List[str] = []
+    focus = fp.todays_focus(today)
+    phase = fp.phase_for(today)
+    tag = f"Day {day_n} of the reset" + (f", {phase['name'].split('—')[0].strip()}" if phase else "")
+    if focus["kind"] == "rest":
+        lines.append(f"{tag}. Today is full rest — no training, protect the recovery.")
+    elif focus["kind"] == "cardio":
+        lines.append(f"{tag}. Today is cardio: {focus['focus'].split('—')[-1].strip()}.")
+    else:
+        lines.append(f"{tag}. Today's lift is {focus['focus']}.")
+    # weight trend
+    st = weight_stats()
+    if st.get("count", 0) >= 2 and st.get("week_change") is not None:
+        d = ("down" if st["week_change"] < 0 else "up" if st["week_change"] > 0 else "flat")
+        lines.append(f"Your 7-day weight average is {st['avg7']}, {d} "
+                     f"{abs(st['week_change'])} from last week.")
+    # refeed heads-up
+    if fp.is_refeed_day(today):
+        lines.append(f"Today is a refeed day — bump to {fp.REFEED_CALORIES} calories, "
+                     "extra carbs at lunch and dinner.")
+    elif fp.is_refeed_day(today + timedelta(days=1)):
+        lines.append("Heads up: tomorrow is a refeed day.")
+    return lines
+
+
+def todays_workout(day: str = "") -> Dict[str, Any]:
+    """Spoken workout for today (or a named weekday). Returns a concise summary
+    plus the exercise list; the voice model reads it, or calls show_workout to
+    put it on screen."""
+    wd_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    d = (day or "").strip().lower()[:3]
+    if d in wd_map:
+        focus = fp.workout_for_weekday(wd_map[d])
+        when = day.strip().title()
+    else:
+        focus = fp.todays_focus()
+        when = "Today"
+    if focus["kind"] == "rest":
+        return {"status": "rest", "focus": focus["focus"],
+                "spoken": f"{when} is a full rest day — no workout. Recovery is the work."}
+    if focus["kind"] == "cardio":
+        return {"status": "cardio", "focus": focus["focus"],
+                "spoken": f"{when} is cardio: {focus['exercises'][0]}."}
+    n = len([e for e in focus["exercises"] if not e.startswith("Abs")])
+    return {"status": "lift", "focus": focus["focus"], "exercises": focus["exercises"],
+            "spoken": f"{when} is {focus['focus']} — {n} exercises. "
+                      "Say 'show me the workout' to put the full list on screen.",
+            "note": "Offer to call show_workout to display the full routine."}
+
+
+def _fitness_css() -> str:
+    return (
+        "body{margin:0;background:#05080d;color:#e8eef5;"
+        "font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}"
+        ".wrap{max-width:1100px;margin:0 auto;padding:4vh 5vw}"
+        "h1{font-size:2.4em;margin:0 0 .1em;font-weight:800;letter-spacing:.5px;"
+        "background:linear-gradient(90deg,#fff,#7fdcff);-webkit-background-clip:text;"
+        "-webkit-text-fill-color:transparent}"
+        ".sub{color:#7fa8c9;margin:0 0 2em;font-size:1.05em}"
+        ".chips{display:flex;flex-wrap:wrap;gap:1em;margin:1.5em 0}"
+        ".chip{background:#0d1520;border:1px solid #22405c;border-radius:12px;"
+        "padding:1em 1.4em;min-width:120px}"
+        ".chip .k{color:#7fa8c9;font-size:.8em;text-transform:uppercase;letter-spacing:.1em}"
+        ".chip .v{font-size:1.8em;font-weight:700;color:#7fdcff}"
+        ".chip .v.amber{color:#ffb84d}"
+        "ol{line-height:1.9;font-size:1.15em;padding-left:1.2em}"
+        "ol li{margin-bottom:.3em}"
+        ".abs{color:#ffb84d;font-weight:600}"
+        "h2{color:#7fdcff;border-bottom:1px solid #22405c;padding-bottom:.3em;margin-top:1.5em}"
+        ".bar{height:14px;background:#0d1520;border-radius:8px;overflow:hidden;margin:.6em 0}"
+        ".bar>i{display:block;height:100%;background:linear-gradient(90deg,#7fdcff,#4fa8d8)}"
+    )
+
+
+def show_workout(config: AssistantConfig, day: str = "") -> Dict[str, Any]:
+    """Build a themed artifact of the day's routine (deterministic, no LLM) and
+    open it in the borderless window on Geo's PC."""
+    wd_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    d = (day or "").strip().lower()[:3]
+    wd = wd_map.get(d, datetime.now().weekday())
+    focus = fp.workout_for_weekday(wd)
+    dayname = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+               "Saturday", "Sunday"][wd]
+    from html import escape
+    items = "".join(
+        f'<li class="{"abs" if e.startswith("Abs") else ""}">{escape(e)}</li>'
+        for e in focus["exercises"])
+    html = (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{escape(dayname)} — {escape(focus['focus'])}</title>"
+            f"<style>{_fitness_css()}</style></head><body><div class='wrap'>"
+            f"<h1>{escape(focus['focus'])}</h1>"
+            f"<p class='sub'>{dayname} · Summer Reset training</p>"
+            f"<ol>{items}</ol></div></body></html>")
+    try:
+        view_url, opened = _save_and_open_artifact(config, html,
+                                                   f"{dayname} Workout")
+    except Exception as e:
+        return {"error": f"could not build workout: {e}"}
+    return {"status": "shown", "focus": focus["focus"], "url": view_url,
+            "opened_on_pc": opened,
+            "spoken": f"Put {dayname}'s {focus['focus']} workout on your screen, sir."}
+
+
+def fitness_progress(config: AssistantConfig) -> Dict[str, Any]:
+    """Build a themed progress dashboard artifact: weight trend sparkline,
+    day-of-plan, projected goal date at current rate, and macro targets."""
+    today = datetime.now().date()
+    st = weight_stats()
+    day_n = fp.plan_day_number(today)
+    phase = fp.phase_for(today)
+    items = sorted(_load_weights(), key=lambda e: e["date"])
+
+    # projected goal date from the 7-day trend (lbs/week)
+    proj = "log a couple weeks to project"
+    if st.get("count", 0) >= 8 and st.get("week_change") and st["week_change"] < 0:
+        weeks = st["to_goal"] / abs(st["week_change"])
+        if weeks > 0:
+            eta = today + timedelta(weeks=weeks)
+            proj = f"~{eta:%b %-d, %Y} at this rate"
+
+    # simple inline SVG sparkline of the last 30 entries
+    spark = ""
+    pts = [e["lbs"] for e in items[-30:]]
+    if len(pts) >= 2:
+        lo, hi = min(pts), max(pts)
+        rng = (hi - lo) or 1
+        w, h = 640, 120
+        coords = " ".join(
+            f"{i / (len(pts) - 1) * w:.1f},{h - (v - lo) / rng * h:.1f}"
+            for i, v in enumerate(pts))
+        spark = (f"<h2>Weight trend (last {len(pts)} weigh-ins)</h2>"
+                 f"<svg viewBox='0 0 {w} {h}' style='width:100%;height:auto;"
+                 f"background:#0d1520;border:1px solid #22405c;border-radius:12px'>"
+                 f"<polyline fill='none' stroke='#7fdcff' stroke-width='2.5' "
+                 f"points='{coords}'/></svg>"
+                 f"<p class='sub'>High {hi} · Low {lo}</p>")
+
+    pct = 0
+    if st.get("latest") is not None:
+        span = fp.START_WEIGHT - fp.GOAL_WEIGHT
+        pct = max(0, min(100, round((fp.START_WEIGHT - st["latest"]) / span * 100)))
+
+    latest = st.get("latest", "—")
+    avg7 = st.get("avg7", "—")
+    m = fp.MACROS
+    html = (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>Summer Reset — Progress</title><style>{_fitness_css()}</style>"
+            f"</head><body><div class='wrap'>"
+            f"<h1>Summer Reset — Progress</h1>"
+            f"<p class='sub'>Day {max(day_n,0)} · {phase['name'] if phase else 'Pre-reset'} · "
+            f"{fp.START_WEIGHT:.0f} → {fp.GOAL_WEIGHT:.0f} lbs</p>"
+            f"<div class='bar'><i style='width:{pct}%'></i></div>"
+            f"<div class='chips'>"
+            f"<div class='chip'><div class='k'>Latest</div><div class='v'>{latest}</div></div>"
+            f"<div class='chip'><div class='k'>7-day avg</div><div class='v'>{avg7}</div></div>"
+            f"<div class='chip'><div class='k'>Lost</div><div class='v amber'>{st.get('lost','—')}</div></div>"
+            f"<div class='chip'><div class='k'>To goal</div><div class='v'>{st.get('to_goal','—')}</div></div>"
+            f"</div>"
+            f"<p class='sub'>Projected goal: {proj}</p>"
+            f"{spark}"
+            f"<h2>Daily targets</h2><div class='chips'>"
+            f"<div class='chip'><div class='k'>Calories</div><div class='v'>{m['calories']}</div></div>"
+            f"<div class='chip'><div class='k'>Protein</div><div class='v'>{m['protein']}g</div></div>"
+            f"<div class='chip'><div class='k'>Carbs</div><div class='v'>{m['carbs']}g</div></div>"
+            f"<div class='chip'><div class='k'>Fat</div><div class='v'>{m['fat']}g</div></div>"
+            f"</div></div></body></html>")
+    try:
+        view_url, opened = _save_and_open_artifact(config, html, "Summer Reset Progress")
+    except Exception as e:
+        return {"error": f"could not build progress: {e}"}
+    spoken = "Here's your progress, sir."
+    if st.get("count", 0) == 0:
+        spoken = ("Progress board is up, but you haven't logged a weigh-in yet — "
+                  "log one each morning and the trend will fill in.")
+    elif st.get("week_change") is not None:
+        d = "down" if st["week_change"] < 0 else "up" if st["week_change"] > 0 else "flat"
+        spoken = (f"You're at {latest}, 7-day average {avg7}, {d} "
+                  f"{abs(st['week_change'])} from last week. {st.get('lost',0)} pounds down so far.")
+    return {"status": "shown", "url": view_url, "opened_on_pc": opened, "spoken": spoken}
 
 
 # ============================
@@ -3869,6 +4265,21 @@ def _execute_tool(
             result = daily_briefing(config, ha_client)
             return result, "error" not in result
 
+        elif fn == "log_weight":
+            result = log_weight(parsed.get("lbs"))
+            return result, "error" not in result
+
+        elif fn == "workout":
+            if parsed.get("show"):
+                result = show_workout(config, str(parsed.get("day", "")))
+            else:
+                result = todays_workout(str(parsed.get("day", "")))
+            return result, "error" not in result
+
+        elif fn == "fitness_progress":
+            result = fitness_progress(config)
+            return result, "error" not in result
+
         elif fn == "remember":
             result = add_memory(str(parsed.get("text", "")))
             return result, "error" not in result
@@ -4198,6 +4609,51 @@ def _anthropic_tools_schema():
                 "'good morning', 'brief me', 'what's my day look like', "
                 "'what's going on today'. Read the returned 'spoken' text "
                 "aloud naturally."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "log_weight",
+            "description": (
+                "Record Geo's morning weigh-in for his Summer Reset plan. "
+                "Use when he says 'log my weight ...', 'I weigh ...', "
+                "'weigh-in one seventy-nine ...'. Returns the fresh 7-day "
+                "average and week trend to read back."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "lbs": {"type": "number", "description": "weight in pounds"},
+                },
+                "required": ["lbs"],
+            },
+        },
+        {
+            "name": "workout",
+            "description": (
+                "Geo's training for today (or a named weekday) from his "
+                "Summer Reset split. Use for 'what's my workout', 'what am I "
+                "training today', 'show me the workout'. Set show=true to put "
+                "the full routine on his PC screen; otherwise it returns a "
+                "spoken summary."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "day": {"type": "string", "description":
+                            "weekday like 'monday' or 'thu'; omit for today"},
+                    "show": {"type": "boolean", "description":
+                             "true = display the full routine on screen"},
+                },
+            },
+        },
+        {
+            "name": "fitness_progress",
+            "description": (
+                "Show Geo's weight-loss progress dashboard on his PC screen: "
+                "weight trend, day of the plan, projected goal date, and macro "
+                "targets. Use for 'how's my progress', 'show my weight "
+                "progress', 'am I on track'."
             ),
             "input_schema": {"type": "object", "properties": {}},
         },
